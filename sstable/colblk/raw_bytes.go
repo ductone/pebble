@@ -6,6 +6,7 @@ package colblk
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -60,6 +61,14 @@ var _ Array[[]byte] = RawBytes{}
 // DecodeRawBytes decodes the structure of a RawBytes, constructing an accessor
 // for an array of byte slices constructed by RawBytesBuilder. Count must be the
 // number of byte slices within the array.
+//
+// The returned accessors compute slices from pairs of offsets using unchecked
+// pointer arithmetic, so DecodeRawBytes validates the offsets table before
+// returning: the table must lie within b, its offsets must be nondecreasing,
+// and the final offset must not extend beyond b. For a positive offset width
+// this is a single scan over the encoded offsets, bounded by len(b). A
+// width-zero table encodes no per-row bytes (every offset is zero), so it is
+// validated in constant time regardless of count.
 func DecodeRawBytes(b []byte, offset uint64, count uint32) (rawBytes RawBytes, endOffset uint64) {
 	if count == 0 {
 		return RawBytes{}, offset
@@ -68,16 +77,108 @@ func DecodeRawBytes(b []byte, offset uint64, count uint32) (rawBytes RawBytes, e
 		panic(errors.AssertionFailedf("count overflow"))
 	}
 	offsets, dataOff := DecodeUnsafeOffsets(b, offset, count+1 /* +1 offset */)
-	endOffset = dataOff + uint64(offsets.At(int(count)))
-	if endOffset > uint64(len(b)) {
+	// The offsets table occupies the tableLen bytes immediately preceding
+	// dataOff. Prove it lies within b before reading any offset; the data
+	// pointer below also requires dataOff to address a byte of b.
+	tableLen := (uint64(count) + 1) * uint64(offsets.width)
+	if dataOff >= uint64(len(b)) {
+		panic(errors.AssertionFailedf("RawBytes offsets table extends beyond slice: data offset %d, slice length %d",
+			errors.Safe(dataOff), errors.Safe(len(b))))
+	}
+	last := checkRawBytesOffsets(b[dataOff-tableLen:dataOff], offsets.width)
+	if uint64(last) > uint64(len(b))-dataOff {
 		panic(errors.AssertionFailedf("RawBytes data extends beyond slice: end offset %d, slice length %d",
-			errors.Safe(endOffset), errors.Safe(len(b))))
+			errors.Safe(dataOff+uint64(last)), errors.Safe(len(b))))
 	}
 	return RawBytes{
 		slices:  int(count),
 		offsets: offsets,
 		data:    unsafe.Pointer(&b[dataOff]),
-	}, endOffset
+	}, dataOff + uint64(last)
+}
+
+// checkRawBytesOffsets verifies that the little-endian offsets of the given
+// width encoded in table are nondecreasing, and returns the final offset. A
+// width-zero table is empty and every offset it represents is zero.
+//
+// The scan reads the encoded bytes through bounds-checked slices rather than
+// UnsafeOffsets, so it is independent of the platform's byte order. It runs on
+// every block cache miss, so it loads eight bytes at a time and accumulates the
+// differences between adjacent offsets without branching: a decrease wraps a
+// difference to a value with the high bit set.
+func checkRawBytesOffsets(table []byte, width uint8) (last uint32) {
+	orig := table
+	var prev, bad uint64
+	switch width {
+	case 0:
+		return 0
+	case 1:
+		for ; len(table) >= 8; table = table[8:] {
+			x := binary.LittleEndian.Uint64(table)
+			v0, v1, v2, v3 := x&0xff, x>>8&0xff, x>>16&0xff, x>>24&0xff
+			v4, v5, v6, v7 := x>>32&0xff, x>>40&0xff, x>>48&0xff, x>>56
+			bad |= (v0 - prev) | (v1 - v0) | (v2 - v1) | (v3 - v2) |
+				(v4 - v3) | (v5 - v4) | (v6 - v5) | (v7 - v6)
+			prev = v7
+		}
+		for _, b := range table {
+			bad |= uint64(b) - prev
+			prev = uint64(b)
+		}
+	case 2:
+		for ; len(table) >= 8; table = table[8:] {
+			x := binary.LittleEndian.Uint64(table)
+			v0, v1, v2, v3 := x&0xffff, x>>16&0xffff, x>>32&0xffff, x>>48
+			bad |= (v0 - prev) | (v1 - v0) | (v2 - v1) | (v3 - v2)
+			prev = v3
+		}
+		for ; len(table) >= 2; table = table[2:] {
+			v := uint64(binary.LittleEndian.Uint16(table))
+			bad |= v - prev
+			prev = v
+		}
+	case 4:
+		for ; len(table) >= 8; table = table[8:] {
+			x := binary.LittleEndian.Uint64(table)
+			v0, v1 := x&0xffffffff, x>>32
+			bad |= (v0 - prev) | (v1 - v0)
+			prev = v1
+		}
+		if len(table) >= 4 {
+			v := uint64(binary.LittleEndian.Uint32(table))
+			bad |= v - prev
+			prev = v
+		}
+	default:
+		panic(errors.AssertionFailedf("invalid RawBytes offset width %d", errors.Safe(width)))
+	}
+	if bad>>63 != 0 {
+		panicNonmonotoneOffsets(orig, width)
+	}
+	return uint32(prev)
+}
+
+// panicNonmonotoneOffsets panics, identifying the first offset in table that is
+// less than its predecessor.
+func panicNonmonotoneOffsets(table []byte, width uint8) {
+	var prev uint32
+	for i := range len(table) / int(width) {
+		var v uint32
+		switch width {
+		case 1:
+			v = uint32(table[i])
+		case 2:
+			v = uint32(binary.LittleEndian.Uint16(table[2*i:]))
+		case 4:
+			v = binary.LittleEndian.Uint32(table[4*i:])
+		}
+		if v < prev {
+			panic(errors.AssertionFailedf("RawBytes offset %d (%d) is less than the preceding offset (%d)",
+				errors.Safe(i), errors.Safe(v), errors.Safe(prev)))
+		}
+		prev = v
+	}
+	panic(errors.AssertionFailedf("RawBytes offsets are not nondecreasing"))
 }
 
 // Assert that DecodeRawBytes implements DecodeFunc.
@@ -123,11 +224,19 @@ func (b *RawBytes) ptr(offset uint32) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(b.data) + uintptr(offset))
 }
 
+// Slice returns the bytes of the data section in [start, end) without bounds
+// checking. Callers must take start and end from this RawBytes' offsets table
+// (indexes in [0, Slices()], start's index <= end's index); DecodeRawBytes
+// proved those offsets are nondecreasing and within the data section.
+//
 //gcassert:inline
 func (b *RawBytes) Slice(start, end uint32) []byte {
 	return unsafe.Slice((*byte)(b.ptr(start)), end-start)
 }
 
+// Offsets returns the start and end offsets of the i'th slice. The index is
+// only checked in invariants builds; callers must ensure 0 <= i < Slices().
+//
 //gcassert:inline
 func (b *RawBytes) Offsets(i int) (start, end uint32) {
 	invariants.CheckBounds(i, b.slices)
@@ -135,6 +244,8 @@ func (b *RawBytes) Offsets(i int) (start, end uint32) {
 }
 
 // At returns the []byte at index i. The returned slice should not be mutated.
+// The index is only checked in invariants builds; callers must ensure
+// 0 <= i < Slices().
 func (b RawBytes) At(i int) []byte {
 	invariants.CheckBounds(i, b.slices)
 	return b.Slice(b.offsets.At2(i))
