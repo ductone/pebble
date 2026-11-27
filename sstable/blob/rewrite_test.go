@@ -220,3 +220,122 @@ func testRewrittenFileGap(t *testing.T, cacheSize int64) {
 		})
 	}
 }
+
+// BenchmarkRewrittenFileAlternatingFetch measures fetching values from a
+// rewritten blob file while alternating between two live virtual blocks that
+// share a physical block. The rewrite drops every block between the two live
+// blocks, leaving a hole of gap entries in the virtual block mapping. Each
+// switch between the virtual blocks remaps the virtual block ID; the "repeat"
+// variant fetches from a single virtual block for comparison. The block cache
+// is large enough to hold every block, and is warmed before timing.
+func BenchmarkRewrittenFileAlternatingFetch(b *testing.B) {
+	for _, hole := range []int{0, 64, 4096, 65536} {
+		b.Run(fmt.Sprintf("hole=%d", hole), func(b *testing.B) {
+			benchmarkRewrittenFileAlternatingFetch(b, hole)
+		})
+	}
+}
+
+func benchmarkRewrittenFileAlternatingFetch(b *testing.B, hole int) {
+	ctx := context.Background()
+	const blobFileID = base.BlobFileID(1)
+	const origFileNum, rewrittenFileNum = base.DiskFileNum(1), base.DiskFileNum(2)
+	const valuesPerBlock = 16
+	opts := FileWriterOptions{
+		FlushGovernor: block.MakeFlushGovernor(64<<10, 90, 0, nil),
+	}
+	val := func(blockID BlockID, valueID BlockValueID) []byte {
+		return fmt.Appendf(nil, "b%d-v%d", blockID, valueID)
+	}
+
+	rp := &mockReaderProvider{readers: map[base.DiskFileNum]*FileReader{}}
+	rp.c = cache.NewWithShards(64<<20, 1)
+	rp.ch = rp.c.NewHandle()
+	defer rp.Close()
+	openReader := func(obj objstorage.Readable, fileNum base.DiskFileNum) {
+		r, err := NewFileReader(ctx, obj, FileReaderOptions{
+			ReaderOptions: block.ReaderOptions{
+				CacheOpts: sstableinternal.CacheOptions{CacheHandle: rp.ch, FileNum: fileNum},
+			},
+		})
+		require.NoError(b, err)
+		rp.readers[fileNum] = r
+	}
+	defer func() {
+		for _, r := range rp.readers {
+			require.NoError(b, r.Close())
+		}
+	}()
+
+	// Write the original file with hole+2 blocks. Only the first and last
+	// blocks hold values that survive the rewrite.
+	lastBlockID := BlockID(hole + 1)
+	origObj := &objstorage.MemObj{}
+	w := NewFileWriter(origFileNum, origObj, opts)
+	for blk := BlockID(0); blk <= lastBlockID; blk++ {
+		if blk > 0 {
+			w.flush()
+		}
+		n := BlockValueID(1)
+		if blk == 0 || blk == lastBlockID {
+			n = valuesPerBlock
+		}
+		for v := BlockValueID(0); v < n; v++ {
+			w.AddValue(val(blk, v), false /* isLikelyMVCCGarbage */)
+		}
+	}
+	_, err := w.Close()
+	require.NoError(b, err)
+	openReader(origObj, origFileNum)
+
+	// Rewrite the file, keeping only the first and last blocks. Both land in
+	// the same physical block.
+	rewrittenObj := &objstorage.MemObj{}
+	rw := NewFileRewriter(blobFileID,
+		base.ObjectInfoLiteral{FileType: base.FileTypeBlob, DiskFileNum: origFileNum},
+		rp, block.ReadEnv{}, rewrittenFileNum, rewrittenObj, opts)
+	valueIDs := make([]int, valuesPerBlock)
+	for i := range valueIDs {
+		valueIDs[i] = i
+	}
+	for _, blk := range []BlockID{0, lastBlockID} {
+		var size int
+		for _, v := range valueIDs {
+			size += len(val(blk, BlockValueID(v)))
+		}
+		require.NoError(b, rw.CopyBlock(ctx, blk, size, valueIDs))
+	}
+	stats, err := rw.Close()
+	require.NoError(b, err)
+	require.Equal(b, 1, int(stats.BlockCount))
+	openReader(rewrittenObj, rewrittenFileNum)
+
+	run := func(b *testing.B, blockIDs []BlockID) {
+		var f ValueFetcher
+		f.Init(inputFileMapping{info: base.ObjectInfoLiteral{
+			FileType: base.FileTypeBlob, DiskFileNum: rewrittenFileNum,
+		}}, rp, block.ReadEnv{}, 1)
+		defer func() { require.NoError(b, f.Close()) }()
+		fetch := func(i int) {
+			blk := blockIDs[i%len(blockIDs)]
+			v, _, err := f.Fetch(ctx, blobFileID, blk, BlockValueID(i%valuesPerBlock))
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(v) == 0 {
+				b.Fatal("empty value")
+			}
+		}
+		// Warm the index block, value block and block cache.
+		for i := 0; i < 2*len(blockIDs); i++ {
+			fetch(i)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			fetch(i)
+		}
+		b.StopTimer()
+	}
+	b.Run("alternating", func(b *testing.B) { run(b, []BlockID{0, lastBlockID}) })
+	b.Run("repeat", func(b *testing.B) { run(b, []BlockID{0}) })
+}

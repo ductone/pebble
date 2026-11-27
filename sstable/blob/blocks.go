@@ -180,7 +180,7 @@ func (d *indexBlockDecoder) Init(data []byte) {
 	// Decode the offsets column. We pass rows+1 because an index block encoding
 	// n block handles encodes n+1 offsets.
 	d.offsets = colblk.DecodeColumn(&d.bd, indexBlockColumnOffsetsIdx,
-		uint32(d.bd.Rows()+1), colblk.DataTypeUint, colblk.DecodeUnsafeUints)
+		uint32(d.bd.Rows())+1, colblk.DataTypeUint, colblk.DecodeUnsafeUints)
 }
 
 // BlockHandle returns the block handle for the given block index in the
