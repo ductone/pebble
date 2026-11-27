@@ -132,8 +132,8 @@ func TestMalformedDataBlockKeyLength(t *testing.T) {
 	}
 }
 
-// FuzzColumnarBlockDecode exercises the generic column encodings and the
-// production metadata paths for data, index and keyspan blocks.
+// FuzzColumnarBlockDecode exercises the column encodings and the data, index,
+// keyspan, key-value and reference-liveness block decoders.
 func FuzzColumnarBlockDecode(f *testing.F) {
 	mixed := buildBlock([]testColumnSpec{
 		{DataType: DataTypeBool}, {DataType: DataTypeUint},
@@ -169,6 +169,16 @@ func FuzzColumnarBlockDecode(f *testing.F) {
 	kw.AddSpan(keyspan.ParseSpan("a-c:{(#100,RANGEDEL)}"))
 	f.Add(uint8(3), kw.Finish())
 
+	var kv KeyValueBlockWriter
+	kv.Init()
+	kv.AddKV([]byte("key"), []byte("value"))
+	f.Add(uint8(4), kv.Finish(kv.Rows()))
+
+	var live ReferenceLivenessBlockEncoder
+	live.Init()
+	live.AddReferenceLiveness(0, []byte{1, 2})
+	f.Add(uint8(5), live.Finish())
+
 	f.Fuzz(func(t *testing.T, format uint8, data []byte) {
 		if len(data) > 64<<10 {
 			return
@@ -180,7 +190,7 @@ func FuzzColumnarBlockDecode(f *testing.F) {
 				}
 			}
 		}()
-		switch format % 4 {
+		switch format % 6 {
 		case 0:
 			d := DecodeBlock(data, 0)
 			if d.Rows() > 32 || d.header.Columns > 4 {
@@ -250,6 +260,25 @@ func FuzzColumnarBlockDecode(f *testing.F) {
 			for row := 0; span != nil && err == nil && row < 32; row++ {
 				_, _ = span.Start, span.End
 				span, err = it.Next()
+			}
+		case 4:
+			var d KeyValueBlockDecoder
+			d.Init(data)
+			if d.bd.Rows() > 32 {
+				return
+			}
+			for row := range d.bd.Rows() {
+				d.KeyAt(row)
+				d.ValueAt(row)
+			}
+		case 5:
+			var d ReferenceLivenessBlockDecoder
+			d.Init(data)
+			if d.bd.Rows() > 32 {
+				return
+			}
+			for row := range d.bd.Rows() {
+				d.LivenessAtReference(row)
 			}
 		}
 	})
