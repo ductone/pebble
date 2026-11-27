@@ -118,6 +118,30 @@ func TestMalformedKeyspanBoundaryIndex(t *testing.T) {
 	expectCorruptBlock(t, func() { d.Init(b) })
 }
 
+func TestConstantKeyspanBoundaryIndex(t *testing.T) {
+	var w KeyspanBlockWriter
+	w.Init(bytes.Equal)
+	for start := byte('a'); start < 'i'; start++ {
+		w.AddSpan(keyspan.Span{Start: []byte{start}, End: []byte{start + 1}})
+	}
+	data := w.Finish()
+	var d KeyspanDecoder
+	d.Init(data)
+	if d.boundaryKeyIndices.width != 0 || d.boundaryKeyIndices.base != 0 {
+		t.Fatalf("expected constant zero boundary indices, got %+v", d.boundaryKeyIndices)
+	}
+
+	w.boundaryKeyIndexes.Reset()
+	for i := range w.boundaryUserKeys.rows {
+		w.boundaryKeyIndexes.Set(i, 1)
+	}
+	data = w.Finish()
+	expectCorruptBlock(t, func() { d.Init(data) })
+	if d.boundaryKeyIndices.width != 0 || d.boundaryKeyIndices.base != 1 {
+		t.Fatalf("expected out-of-range constant boundary indices, got %+v", d.boundaryKeyIndices)
+	}
+}
+
 func TestDataBlockMaximumKeyLengthBound(t *testing.T) {
 	var w DataBlockEncoder
 	w.Init(&testKeysSchema)

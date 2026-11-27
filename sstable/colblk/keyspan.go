@@ -241,8 +241,13 @@ func (d *KeyspanDecoder) Init(data []byte) {
 		int(d.boundaryKeysCount), DataTypeUint, DecodeUnsafeUints)
 	// Boundary indices feed unchecked trailer, suffix and value accessors.
 	// Check their bounds and ordering before making the decoder available.
+	count := int(d.boundaryKeysCount)
+	if d.boundaryKeyIndices.width == 0 && count > 1 {
+		// A constant index needs only one bounds check.
+		count = 1
+	}
 	var prev uint64
-	for i := range int(d.boundaryKeysCount) {
+	for i := range count {
 		idx := d.boundaryKeyIndices.At(i)
 		if idx < prev || idx > uint64(d.blockDecoder.header.Rows) {
 			panic(errors.AssertionFailedf("keyspan boundary index %d is outside [previous %d, rows %d]: %d",
