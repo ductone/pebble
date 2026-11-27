@@ -212,12 +212,121 @@ do not ask reviewers to accept the whole architecture before the first fix.
 | 1. Output capacity | Match the existing built-in untyped-suffix idiom: slice the destination before the MVCC suffix stores. Widen synthetic prefix/recorded-max/suffix arithmetic before narrowing, without shrinking valid custom-schema capacity or adding a clamp. | In default builds, test wall-only (+10) and wall+logical (+14) output with exact-fit and restricted-capacity canaries; exercise length overflow in both iterator initializers without huge allocations. |
 | 2. Page and uint extents | Complete the physical checks begun in #5856: validate page starts in `BlockDecoder.Init`, confine `DecodeColumn` before its callback, and bound `DecodeUnsafeUints` before returning an unsafe view. Adapt shared callers; assign lazy tiering views together after both decode, in a small companion commit. | A malformed-block table failing on master, valid writer/old block fixtures, zero-row padding, width-zero/delta base, direct/cached reads, a tiering-second-column failure followed by reinit, `GOARCH=386` build, decoder and warm-tiering first-use benchmarks. |
 | 3. RawBytes offsets | Check monotonicity once in the `RawBytes` constructor before returning unchecked accessors; skip the scan for width-zero constants. A per-row checked-consumer design is fallback only if measured cold misses make the scan unacceptable and *every* dependent path is covered. | Compare a cold block load plus sparse seek with warm `BenchmarkDataBlockIter` reads on the same writer blocks; test nonmonotone offsets, decoded values and contextual cached corruption. |
-| Follow-ups | Handle bitmap/prefix semantic summaries, keyspan indexes and blob remaps in separate small PRs; cover direct and nested/lazy paths and error conversion by call site. Add constructor fuzz targets, then row blocks/WAL/MANIFEST with format-specific notes. | Preserve each path's API contract and report new rejections; do not claim coverage before its own proof lands. |
 
 If the hotfix lands upstream first, reuse its tested checks and submit only the
 remaining work rather than duplicating them. Backport relevant landed slices
 to the v2 consumer line only while necessary; track fork maintenance and exit
 separately. Code review and technical CI never grant merge authority.
+
+## Source-backed follow-up slices
+
+These are candidate fork PRs, not claims that source inspection has reproduced
+each failure. Start each with a malformed fixture reaching the named boundary,
+then preserve valid writer output. The fork's default branch is `master`, not
+`main`: independent PRs target it; genuinely dependent reviews target the
+previous topic branch until the series is assembled. Do not duplicate earlier
+patches, open upstream PRs or merge PRs as part of this work. PRs 1–3 above
+remain the columnar foundation.
+
+1. **Block handles (independent, tiny).** `sstable/block.DecodeHandle`
+   slices `src[n:]` before checking whether `binary.Uvarint` returned a
+   negative count for an overflowing first varint. Check both counts before
+   using them and retain the documented `(Handle{}, 0)` invalid-input
+   contract. Test an overflowing first and second varint plus a writer
+   round trip; existing callers should still report corruption. No hot-path
+   benchmark is needed for this change.
+2. **Blob remapping (independent, small).** The writer's
+   `indexBlockEncoder.AddVirtualBlockMapping` puts the gap sentinel in the
+   *low* 32 bits; `cachedReader.GetUnsafeValue` compares the decoded
+   *high* half, so that check never catches a referenced gap. Preserve
+   writer-produced gap entries but reject a reference to one before using
+   `indexBlockDecoder.BlockHandle`. Prove virtual/physical block indexes and
+   adjacent offset order before their unchecked reads or subtraction;
+   check `ValueID + valueIDOffset` in widened arithmetic against loaded
+   value rows on both cold and cached paths. Exercise a rewritten file
+   with a gap followed by a live block and nonzero value offset, valid
+   repeat fetches and invalid virtual/value IDs; require contextual fetch
+   errors. Benchmark warm fetch compares if they land on that path.
+3. **Blob and value-block handle bytes (two independent PRs).** In
+   `sstable/blob/handle.go` and `sstable/valblk/valblk.go`, the respective
+   preface and suffix decoders load up to four continuation bytes via
+   `unsafe.Add` without checking `len(src)`. Preserve the short valid
+   fast path; fall back to checked decode for truncated encodings, or prove
+   each byte before use. Test truncation at each varint position with a
+   restricted-capacity canary, both eager handle creation and lazy
+   `ValueFetcher.FetchHandle` / `valblk` fetch, and existing writer round
+   trips. Decide whether the caller returns an error or a checked panic;
+   if an exported signature changes, update all callers. Benchmark valid
+   handle-heavy iteration, not just an isolated cold decoder.
+4. **Row-block entry and seek paths (two dependent PRs).** In
+   `sstable/rowblk/rowblk_iter.go`, `Iter.Init` reads a restart footer;
+   `readFirstKey`, `readEntry` and seek/skip loops decode unrolled varints
+   through unchecked pointers, then form `unsafe.Slice` key/value views.
+   First prove footer/restart extents and entry lengths before key/value
+   slices; then cover the separate seek/skip pointer paths before claiming
+   whole-block protection. Test writer blocks with several restart groups
+   and empty blocks, corrupted restart offsets, truncated 1–5-byte
+   varints, too-short internal keys, inflated unshared/value lengths, and
+   forward/reverse/seek behavior with canaries. Preserve the iterator's
+   error contract; compare cold `Init` and existing
+   `BenchmarkBlockIterSeekGE/SeekLT/Next/Prev`, deciding between a one-time
+   scan and hot-path guards from measured cost. Row blocks remain in use
+   for older table formats, not just historical test data.
+5. **Prefix bundle arithmetic (after PRs 2–3).**
+   `DecodePrefixBytes` reads an untrusted bundle shift; `bundleCalc` derives
+   counts and indexes consumed by `PrefixBytes.SetAt`, `SetNext`,
+   `UnsafeFirstSlice` and `Search`. Prove the derived offset indexes in
+   representable arithmetic before unchecked access, preserving the
+   block-wide shared prefix stored at offset zero. Determine the actual
+   writer-supported shift range before choosing a cutoff: the writer uses
+   `TrailingZeros32`, so do not reject a valid large bundle by assumption.
+   Mutate shifts and index counts, test single/partial bundles and duplicate
+   keys across boundaries against writer output; benchmark cold decode
+   only if it gains more than an O(1) check.
+6. **Bitmap summary targets (after PR 2).** `DecodeBitmap` proves the
+   encoded nonzero bitmap's size, but `SeekSetBitGE/LE` can use a
+   summary-selected primary word through unchecked `data.At`. Reject a
+   nonexistent target before the read and set bits beyond `bitCount`
+   in the final primary word; zero encoding remains O(1). Test writer
+   zero/dense/sparse bitmaps at 63/64/65 bits, corrupt tail-summary and
+   padding bits, and forward/reverse seeks. Measure summary-seek and cold
+   decode. A false summary that hides real bits is also malformed, but a
+   full consistency scan is a separately measured semantic decision, not
+   silently covered by the minimal bounds fix.
+7. **Keyspan boundary indexes (after PRs 2–3).**
+   `KeyspanDecoder.Init` decodes separately counted boundary indices;
+   `keyspanIter.materializeSpan` uses them to index trailers, suffixes and
+   values. Prove nondecreasing indexes within key-row count before
+   exposing the iterator; equal indexes are valid gaps. Check width-zero
+   constants once, not once per logical row. Test writer gapped/empty
+   spans, decreasing and past-end indexes across
+   `First/Last/SeekGE/SeekLT/Next/Prev`; retain
+   `BenchmarkKeyspanBlock_RangeDeletions` and measure cold validation if it
+   scans positive-width entries.
+8. **Direct and nested error boundaries (after PRs 2–3, by caller).**
+   `ReferenceLivenessBlockDecoder.Init` executes after a no-op cache
+   metadata initializer in ingest, blob rewrite, level checking and layout.
+   Confirm each call's recovery/error contract, check `refID < Rows()` in
+   blob rewrite before `LivenessAtReference`, and make
+   `DecodeBlobRefLivenessEncoding` validate its bitmap size before a Go
+   slice that currently panics despite the function's error return.
+   A separate reader-open PR may wrap `decodePropertiesBlock` and
+   columnar metaindex direct initialization if a malformed fixture
+   proves an escaping assertion. Test each actual public call site with
+   writer-produced positives, truncated outer/inner bytes, no partial
+   state and contextual errors. The histogram describer is another
+   *conditional* caller, not part of the liveness PR by default; avoid
+   claiming a new unsafe read in the bitmap's Go slice itself.
+
+Seed constructor fuzz targets with writer-produced blocks and mutated
+counts, shifts, offsets and truncated varints in their owning PRs once
+the regression is fixed. Add row-block targets after its guards. WAL
+`record.Reader` and MANIFEST `VersionEdit.Decode` did not show an `unsafe`
+decoder in this initial source survey: audit their error contracts and
+write a format-specific target only with a proved gap. MANIFEST variable
+lengths may drive large allocations; constrain the *fuzz harness* without
+adding a production size cap under this RFC. No fake no-op PR is needed
+when an audit finds no relevant defect.
 
 Error conversion is separate from the memory-safety proof:
 
