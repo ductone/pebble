@@ -11,7 +11,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2/internal/base"
 	"github.com/cockroachdb/pebble/v2/internal/binfmt"
-	"github.com/cockroachdb/pebble/v2/internal/invariants"
 	"github.com/cockroachdb/pebble/v2/internal/treeprinter"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/cockroachdb/pebble/v2/sstable/colblk"
@@ -23,6 +22,11 @@ const (
 	indexBlockColumnVirtualBlocksIdx = 0
 	indexBlockColumnOffsetsIdx       = 1
 
+	// virtualBlockIndexMask masks the physical block index stored in the
+	// low 32 bits of a virtualBlocks value. A virtualBlocks value whose
+	// physical block index equals virtualBlockIndexMask is a gap: the virtual
+	// block has no live values in the rewritten file and must not be
+	// referenced (see AddVirtualBlockMapping).
 	virtualBlockIndexMask = 0x00000000ffffffff
 )
 
@@ -100,7 +104,9 @@ func (e *indexBlockEncoder) AddVirtualBlockMapping(
 		panic(errors.AssertionFailedf("virtual block ID %d is out of order; expected %d", virtualBlockID, e.countVirtualBlocks))
 	}
 	// If there's a gap within the virtual block IDs, we fill in the gap with
-	// entries that clarify these blocks are empty.
+	// entries that clarify these blocks are empty. The gap sentinel occupies
+	// the physical block index (the low 32 bits); readers must reject
+	// references to it.
 	for id := BlockID(e.countVirtualBlocks); id < virtualBlockID; id++ {
 		e.virtualBlocks.Set(int(id), virtualBlockIndexMask)
 		e.countVirtualBlocks++
@@ -169,32 +175,67 @@ func (d *indexBlockDecoder) Init(data []byte) {
 }
 
 // BlockHandle returns the block handle for the given block index in the
-// range [0, bd.Rows()).
-func (d *indexBlockDecoder) BlockHandle(blockIndex int) block.Handle {
-	invariants.CheckBounds(blockIndex, d.bd.Rows())
+// range [0, bd.Rows()). It returns a corruption error if blockIndex is out of
+// range or the adjacent offsets do not describe a valid block.
+func (d *indexBlockDecoder) BlockHandle(blockIndex int) (block.Handle, error) {
+	if blockIndex < 0 || blockIndex >= d.bd.Rows() {
+		return block.Handle{}, base.CorruptionErrorf("blob: physical block index %d out of range [0, %d)",
+			errors.Safe(blockIndex), errors.Safe(d.bd.Rows()))
+	}
+	// The offsets column has bd.Rows()+1 rows, so blockIndex+1 is in range.
 	// TODO(jackson): Add an At2 method to the UnsafeUints type too.
 	offset := d.offsets.At(blockIndex)
 	offset2 := d.offsets.At(blockIndex + 1)
+	if offset2 < offset || offset2-offset < block.TrailerLen {
+		return block.Handle{}, base.CorruptionErrorf("blob: invalid offsets [%d, %d) for physical block %d",
+			errors.Safe(offset), errors.Safe(offset2), errors.Safe(blockIndex))
+	}
 	return block.Handle{
 		Offset: offset,
 		Length: offset2 - offset - block.TrailerLen,
+	}, nil
+}
+
+// virtualBlockMapping returns the decoded virtualBlocks entry for the virtual
+// block ID i. If gap is true, the virtual block has no live values and
+// blockIndex and valueIDOffset are meaningless.
+//
+// REQUIRES: 0 <= i < d.virtualBlockCount
+func (d *indexBlockDecoder) virtualBlockMapping(
+	i int,
+) (blockIndex int, valueIDOffset BlockValueID, gap bool) {
+	v := d.virtualBlocks.At(i)
+	if v&virtualBlockIndexMask == virtualBlockIndexMask {
+		return 0, 0, true
 	}
+	return int(v & virtualBlockIndexMask), BlockValueID(v >> 32), false
 }
 
 // RemapVirtualBlockID remaps a virtual block ID to a physical block index and a
 // value ID offset. RemapVirtualBlockID should only be called on index blocks
 // with a non-empty virtual blocks column (i.e., index blocks for rewritten blob
-// files).
+// files). It returns an error if blockID is out of range, refers to a gap (a
+// virtual block with no live values), or maps to an out-of-range physical
+// block index.
 //
 // REQUIRES: d.virtualBlockCount > 0
 func (d *indexBlockDecoder) RemapVirtualBlockID(
 	blockID BlockID,
-) (blockIndex int, valueIDOffset BlockValueID) {
-	invariants.CheckBounds(int(blockID), d.virtualBlockCount)
-	v := d.virtualBlocks.At(int(blockID))
-	blockIndex = int(v & virtualBlockIndexMask)
-	valueIDOffset = BlockValueID(v >> 32)
-	return blockIndex, valueIDOffset
+) (blockIndex int, valueIDOffset BlockValueID, err error) {
+	if uint64(blockID) >= uint64(d.virtualBlockCount) {
+		return 0, 0, base.CorruptionErrorf("blob: virtual block ID %d out of range [0, %d)",
+			errors.Safe(blockID), errors.Safe(d.virtualBlockCount))
+	}
+	blockIndex, valueIDOffset, gap := d.virtualBlockMapping(int(blockID))
+	if gap {
+		return 0, 0, errors.AssertionFailedf("blob: virtual block ID %d should be unreferenced",
+			errors.Safe(blockID))
+	}
+	if blockIndex >= d.bd.Rows() {
+		return 0, 0, base.CorruptionErrorf("blob: virtual block ID %d maps to physical block index %d out of range [0, %d)",
+			errors.Safe(blockID), errors.Safe(blockIndex), errors.Safe(d.bd.Rows()))
+	}
+	return blockIndex, valueIDOffset, nil
 }
 
 // BlockCount returns the number of physical blocks encoded in the index block.
