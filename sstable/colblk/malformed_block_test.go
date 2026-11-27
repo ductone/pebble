@@ -50,6 +50,15 @@ func TestMalformedColumnarBlockBounds(t *testing.T) {
 		binary.LittleEndian.PutUint32(data[blockHeaderBaseSize+1:], uint32(len(data)+1))
 		assertDecodePanics(t, func() { DecodeBlock(data, 0) })
 	})
+	t.Run("out-of-range column", func(t *testing.T) {
+		var w UintBuilder
+		w.Init()
+		w.Set(0, 1)
+		d := DecodeBlock(FinishBlock(1, []ColumnWriter{&w}), 0)
+		for _, col := range []int{-1 << 16, 1 << 16} {
+			assertDecodePanics(t, func() { d.DataType(col) })
+		}
+	})
 
 	t.Run("intermediate raw bytes offset", func(t *testing.T) {
 		var w RawBytesBuilder

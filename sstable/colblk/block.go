@@ -353,7 +353,7 @@ func (d *BlockDecoder) Rows() int {
 // DataType returns the data type of the col'th column. Every column's data type
 // is encoded within the block header.
 func (d *BlockDecoder) DataType(col int) DataType {
-	if uint16(col) >= d.header.Columns {
+	if col < 0 || col >= int(d.header.Columns) {
 		panic(errors.AssertionFailedf("column %d is out of range [0, %d)", errors.Safe(col), errors.Safe(d.header.Columns)))
 	}
 	return d.dataType(col)
