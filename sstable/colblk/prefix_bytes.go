@@ -213,6 +213,9 @@ func DecodePrefixBytes(
 	// expressed as log2 of the bundle size (the bundle size must always be a
 	// power of two)
 	bundleShift := uint32(*((*uint8)(unsafe.Pointer(&b[offset]))))
+	if bundleShift >= 32 {
+		panic(errors.AssertionFailedf("invalid PrefixBytes bundle shift %d", errors.Safe(bundleShift)))
+	}
 	calc := makeBundleCalc(bundleShift)
 	nBundles := uint32(calc.bundleCount(int(count)))
 	totalSlices := count + nBundles

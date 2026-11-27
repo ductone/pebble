@@ -241,6 +241,17 @@ func (d *KeyspanDecoder) Init(data []byte) {
 		d.boundaryKeysCount, DataTypeBytes, DecodeRawBytes)
 	d.boundaryKeyIndices = DecodeColumn(&d.blockDecoder, keyspanColBoundaryKeyIndices,
 		d.boundaryKeysCount, DataTypeUint, DecodeUnsafeUints)
+	// The boundary indices are used as unchecked indices into the key columns
+	// while materializing spans. Validate them before exposing this decoder.
+	var prev uint64
+	for i := range int(d.boundaryKeysCount) {
+		idx := d.boundaryKeyIndices.At(i)
+		if idx < prev || idx > uint64(d.blockDecoder.header.Rows) {
+			panic(errors.AssertionFailedf("keyspan boundary index %d is outside [previous %d, rows %d]: %d",
+				errors.Safe(i), errors.Safe(prev), errors.Safe(d.blockDecoder.header.Rows), errors.Safe(idx)))
+		}
+		prev = idx
+	}
 
 	d.trailers = d.blockDecoder.Uints(keyspanColTrailers)
 	d.suffixes = d.blockDecoder.RawBytes(keyspanColSuffixes)

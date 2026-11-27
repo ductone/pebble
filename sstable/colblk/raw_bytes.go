@@ -68,16 +68,33 @@ func DecodeRawBytes(b []byte, offset uint64, count uint32) (rawBytes RawBytes, e
 		panic(errors.AssertionFailedf("count overflow"))
 	}
 	offsets, dataOff := DecodeUnsafeOffsets(b, offset, count+1 /* +1 offset */)
-	endOffset = dataOff + uint64(offsets.At(int(count)))
-	if endOffset > uint64(len(b)) {
+	if dataOff >= uint64(len(b)) {
+		panic(errors.AssertionFailedf("RawBytes data starts beyond slice: offset %d, slice length %d",
+			errors.Safe(dataOff), errors.Safe(len(b))))
+	}
+	last := offsets.At(int(count))
+	if uint64(last) > uint64(len(b))-dataOff {
 		panic(errors.AssertionFailedf("RawBytes data extends beyond slice: end offset %d, slice length %d",
-			errors.Safe(endOffset), errors.Safe(len(b))))
+			errors.Safe(dataOff+uint64(last)), errors.Safe(len(b))))
+	}
+	// The final offset alone does not bound intermediate slices. Both At2 and
+	// PrefixBytesIter use unchecked pointer arithmetic on these offsets.
+	if offsets.width != 0 {
+		prev := offsets.At(0)
+		for i := 1; i <= int(count); i++ {
+			next := offsets.At(i)
+			if next < prev || next > last {
+				panic(errors.AssertionFailedf("RawBytes offsets are not monotonic at index %d: %d, %d, final %d",
+					errors.Safe(i), errors.Safe(prev), errors.Safe(next), errors.Safe(last)))
+			}
+			prev = next
+		}
 	}
 	return RawBytes{
 		slices:  int(count),
 		offsets: offsets,
 		data:    unsafe.Pointer(&b[dataOff]),
-	}, endOffset
+	}, dataOff + uint64(last)
 }
 
 // Assert that DecodeRawBytes implements DecodeFunc.

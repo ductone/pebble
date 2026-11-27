@@ -287,15 +287,19 @@ func FinishBlock(rows int, writers []ColumnWriter) []byte {
 func DecodeColumn[V any](
 	d *BlockDecoder, col int, rows uint32, dataType DataType, decodeFunc DecodeFunc[V],
 ) V {
-	if uint16(col) >= d.header.Columns {
+	if col < 0 || col >= int(d.header.Columns) {
 		panic(errors.AssertionFailedf("column %d is out of range [0, %d)", errors.Safe(col), errors.Safe(d.header.Columns)))
 	}
 	if dt := d.dataType(col); dt != dataType {
 		panic(errors.AssertionFailedf("column %d is type %s; not %s", errors.Safe(col), dt, dataType))
 	}
-	v, endOffset := decodeFunc(d.data, d.pageStart(col), rows)
-	if nextColumnOff := d.pageStart(col + 1); endOffset != nextColumnOff {
-		panic(errors.AssertionFailedf("column %d decoded to offset %d; expected %d", errors.Safe(col), errors.Safe(endOffset), errors.Safe(nextColumnOff)))
+	// Restrict the decoder to this column (and its trailing byte, which may
+	// serve as the address of an empty slice). Decoders must check their
+	// offsets before constructing views over the block.
+	end := d.pageStart(col + 1)
+	v, endOffset := decodeFunc(d.data[:uint64(end)+1], d.pageStart(col), rows)
+	if endOffset != uint64(end) {
+		panic(errors.AssertionFailedf("column %d decoded to offset %d; expected %d", errors.Safe(col), errors.Safe(endOffset), errors.Safe(end)))
 	}
 	return v
 }
@@ -316,13 +320,29 @@ func DecodeBlock(data []byte, customHeaderSize uint32) BlockDecoder {
 	return d
 }
 
-// Init initializes a BlockDecoder with the data contained in the provided block.
+// Init checks the column header and page bounds before any decoder constructs
+// unsafe views of the block. Column decoders validate their own contents.
 func (d *BlockDecoder) Init(data []byte, customHeaderSize uint32) {
-	*d = BlockDecoder{
-		data:             data,
-		header:           DecodeHeader(data[customHeaderSize:]),
-		customHeaderSize: customHeaderSize,
+	if uint64(customHeaderSize)+blockHeaderBaseSize+1 > uint64(len(data)) {
+		panic(errors.AssertionFailedf("columnar block header is truncated"))
 	}
+	header := DecodeHeader(data[customHeaderSize:])
+	headerEnd := uint64(customHeaderSize) + blockHeaderBaseSize + uint64(header.Columns)*columnHeaderSize
+	if header.Version != Version1 || headerEnd >= uint64(len(data)) || headerEnd > uint64(^uint32(0)) {
+		panic(errors.AssertionFailedf("invalid columnar block header: version %d, columns %d, block length %d",
+			errors.Safe(header.Version), errors.Safe(header.Columns), errors.Safe(len(data))))
+	}
+	prev := uint32(headerEnd)
+	for col := range int(header.Columns) {
+		headerOff := uint64(customHeaderSize) + blockHeaderBaseSize + uint64(col)*columnHeaderSize
+		pageOff := binary.LittleEndian.Uint32(data[headerOff+1:])
+		if pageOff < prev || uint64(pageOff) >= uint64(len(data)) {
+			panic(errors.AssertionFailedf("column %d starts outside its page: offset %d, previous %d, block length %d",
+				errors.Safe(col), errors.Safe(pageOff), errors.Safe(prev), errors.Safe(len(data))))
+		}
+		prev = pageOff
+	}
+	*d = BlockDecoder{data: data, header: header, customHeaderSize: customHeaderSize}
 }
 
 // Rows returns the number of rows in the block, as indicated by the block header.

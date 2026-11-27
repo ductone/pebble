@@ -30,12 +30,12 @@ var _ Array[uint64] = UnsafeUints{}
 // DecodeUnsafeUints decodes the structure of a slice of uints from a
 // byte slice.
 func DecodeUnsafeUints(b []byte, off uint64, rows uint32) (_ UnsafeUints, endOffset uint64) {
+	if off >= uint64(len(b)) {
+		panic(errors.AssertionFailedf("uint column starts beyond its buffer: offset %d, length %d",
+			errors.Safe(off), errors.Safe(len(b))))
+	}
 	if rows == 0 {
-		// NB: &b[off] is actually pointing beyond the uints serialization.  We
-		// ensure this is always valid at the block-level by appending a
-		// trailing 0x00 block padding byte to all serialized columnar blocks.
-		// This means &b[off] will always point to a valid, allocated byte even
-		// if this is the last column of the block.
+		// The final padding byte makes even an empty column's pointer valid.
 		return makeUnsafeUints(0, unsafe.Pointer(&b[off]), 0), off
 	}
 	encoding := UintEncoding(b[off])
@@ -51,6 +51,12 @@ func DecodeUnsafeUints(b []byte, off uint64, rows uint32) (_ UnsafeUints, endOff
 	w := encoding.Width()
 	if w > 0 {
 		off = align(off, uint64(w))
+	}
+	// Accessors use unchecked pointer arithmetic. Prove the whole column is
+	// present before constructing one; the caller checks the exact page end.
+	if off >= uint64(len(b)) || (w > 0 && uint64(rows) > (uint64(len(b))-off)/uint64(w)) {
+		panic(errors.AssertionFailedf("uint column extends beyond its buffer: offset %d, rows %d, width %d, length %d",
+			errors.Safe(off), errors.Safe(rows), errors.Safe(w), errors.Safe(len(b))))
 	}
 	return makeUnsafeUints(base, unsafe.Pointer(&b[off]), w), off + uint64(rows)*uint64(w)
 }

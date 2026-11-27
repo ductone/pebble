@@ -37,26 +37,45 @@ type Bitmap struct {
 var _ Array[bool] = Bitmap{}
 
 // DecodeBitmap decodes the structure of a Bitmap and returns a Bitmap that
-// reads from b supporting bitCount logical bits. No bounds checking is
-// performed, so the caller must guarantee the bitmap is appropriately sized and
-// the provided bitCount correctly identifies the number of bits in the bitmap.
+// reads from b supporting bitCount logical bits. The encoded summary must
+// agree with the data words: seek operations use it as an unchecked index.
 func DecodeBitmap(b []byte, off uint64, bitCount uint32) (bitmap Bitmap, endOffset uint64) {
 	encoding := bitmapEncoding(b[off])
 	off++
 	if encoding == zeroBitmapEncoding {
 		return Bitmap{bitCount: int(bitCount)}, off
 	}
+	if encoding != defaultBitmapEncoding {
+		panic(errors.AssertionFailedf("unknown bitmap encoding %d", errors.Safe(encoding)))
+	}
 	off = align(off, align64)
 	sz := bitmapRequiredSize(int(bitCount))
 	endOffset = off + uint64(sz)
 	if endOffset > uint64(len(b)) {
 		panic(errors.AssertionFailedf("bitmap of %d bits requires at least %d bytes; provided with %d-byte slice",
-			errors.Safe(bitCount), errors.Safe(sz), errors.Safe(len(b[off:]))))
+			errors.Safe(bitCount), errors.Safe(sz), errors.Safe(len(b))))
 	}
-	return Bitmap{
+	bitmap = Bitmap{
 		data:     makeUnsafeUint64Decoder(b[off:], sz>>align64Shift),
 		bitCount: int(bitCount),
-	}, endOffset
+	}
+	nWords := (int(bitCount) + 63) >> 6
+	if rem := bitCount & 63; rem != 0 && bitmap.data.At(nWords-1)>>rem != 0 {
+		panic(errors.AssertionFailedf("bitmap has bits beyond its row count"))
+	}
+	nSummaryWords := (nWords + 63) >> 6
+	for summary := range nSummaryWords {
+		var expected uint64
+		for j := range min(64, nWords-summary*64) {
+			if bitmap.data.At(summary*64+j) != 0 {
+				expected |= 1 << j
+			}
+		}
+		if bitmap.data.At(nWords+summary) != expected {
+			panic(errors.AssertionFailedf("bitmap summary %d does not match its data words", errors.Safe(summary)))
+		}
+	}
+	return bitmap, endOffset
 }
 
 // Assert that DecodeBitmap implements DecodeFunc.
