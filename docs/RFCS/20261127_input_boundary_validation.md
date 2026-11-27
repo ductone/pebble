@@ -7,17 +7,18 @@
 
 # Summary
 
-Give every unchecked read or write of encoded data a nearby, reviewable proof that
-its address and length are inside an owned, still-live buffer. Validate once when
-bytes become a decoded view, then keep iteration and seeking fast. The proof must
-cover arithmetic overflow, column/page extents, dependent indexes, mutable
-buffers, and materialized output capacity; a checksum or a writer's usual output
-is not a substitute. Corrupt bytes may produce a corruption error or an
-assertion, but must never cause an out-of-bounds read or write.
+Every unchecked access to encoded bytes needs a proof of its physical extent,
+logical index and buffer lifetime before the access. Use the cheapest proof at
+the owning decoder: eagerly for a small fixed header, lazily for optional
+payloads, or at an access point when scanning first would cost more. Reuse the
+proof rather than adding bounds checks to every hot-path operation.
 
-This is a *series* of small changes, not a wholesale replacement of Pebble's
-columnar decoding or an on-disk format change. It separates memory safety from
-resource-exhaustion policy and keeps performance evidence alongside each step.
+On invalid input, stop processing the affected block: return corruption or
+assert before unsafe memory access, without exposing a partial view. This
+series of small changes uses Pebble's existing `Init`/`Decode` structure, keeps
+writer-compatible encodings, and treats allocation limits as a related but
+separate obligation. No on-disk format change or general decoding framework
+is proposed.
 
 # Motivation and scope
 
@@ -42,16 +43,16 @@ handle. Inner payloads (for example tiered histogram values) have their own
 validation boundary. These are distinct proof owners, not a single
 once-before-cache guarantee for all subformats.
 
-The [columnar hardening topic at `6df164f0`](https://github.com/ductone/pebble/commit/6df164f0a095144dcaf9924a61bbc6d635bdfab3)
-adds earlier page-header and column bounds checks, among other repairs; do
-not attribute those checks to the pinned upstream-master baseline. Its
-writer-produced excluded-key case shows why a seemingly obvious rule
-(`recorded maximum key length <= block length`) can reject valid blocks.
-The topic is a near-term fix, **not** evidence that every format is safe. Its
-v2.1.7-based [integration line](https://github.com/ductone/pebble/tree/c1-integration-v2)
-exists for a consumer pinned to v2; this RFC targets upstream master first.
+As prior art, the [fork's columnar hardening topic at `6df164f0`](https://github.com/ductone/pebble/commit/6df164f0a095144dcaf9924a61bbc6d635bdfab3)
+adds earlier page-header and column bounds checks, plus materialization
+repairs; none is in the pinned upstream master. A writer-produced excluded-key
+case shows why `recorded maximum key length <= block length` can reject valid
+blocks. The topic is a near-term fix, **not** proof that every format is safe.
+Its v2.1.7-based [consumer integration line](https://github.com/ductone/pebble/tree/c1-integration-v2)
+is separate from the upstream-master PR sequence below: that port must account
+for master's `offset uint64, rows uint32` decoder signatures.
 
-## Initial proof matrix: unsigned columns
+## First proof matrix: unsigned columns
 
 This matrix describes the pinned master baseline, not the separate hotfix.
 Each implementation PR should extend it only for the consumers it migrates.
@@ -62,6 +63,7 @@ Each implementation PR should extend it only for the consumers it migrates.
 | `DecodeColumn` calling `DecodeUnsafeUints` | Passes the whole block, then compares the returned offset with the next page. A decoder can construct an unsafe view before that comparison. | Pass a proved page extent to the decoder, allow only an explicitly non-dereferenced sentinel byte, and require an exact decoded end. |
 | [`DecodeUnsafeUints`](../../sstable/colblk/unsafe_uints.go) constructing its pointer | A Go bounds check for `&b[off]` does not prove `rows * width` bytes are present; a delta base and alignment also advance the cursor. | Prove base/alignment/width and whole physical span before pointer construction; width zero checks the constant once and needs no row scan. |
 | `UnsafeUints.At` and `UnsafeOffsets.At2`, reached by seeks/iteration and dependent columns | Indexing uses unchecked pointer arithmetic; a valid encoded span alone does not prove caller indexes. | Owning iterator or dependent decoder establishes row/adjacent-index range; pin an immutable block while the view remains live. |
+| `RawBytes` consuming `UnsafeOffsets` | It bounds only the final offset; intermediate offsets can be unordered, and accessors use unchecked addresses. | Check all relevant offsets once if a cache-miss scan is justified, or guard the few dependent consumers; width-zero offsets need no scan. |
 
 The metadata callbacks recover initialization panics as corruption, but they
 cannot undo an unsafe access. An optional lazily decoded column has its own
@@ -69,10 +71,10 @@ first-use proof even when the surrounding block was cached successfully.
 
 Goals:
 
-1. For every decoder path in scope, reject or safely panic on malformed
-   extents *before* forming or dereferencing an unsafe pointer or slice.
-2. Express each proof once at the boundary where bytes become a reusable view;
-   do not add a bounds check to every `At`, `Next`, or `Seek` hot path.
+1. For every decoder path in scope, stop on malformed extents before an unsafe
+   access; never expose a partially validated view.
+2. Validate at construction when a reusable proof pays off; allow first-use or
+   checked-consumer validation when it is both sound and cheaper.
 3. Preserve all writer-produced and supported historical encodings, including
    zero-width constant columns, legitimate empty columns, and compressed
    logical row counts disproportionate to encoded bytes.
@@ -101,89 +103,82 @@ view*, not to an arbitrary `[]byte`:
   byte*; an adjacent-page or trailing byte borrowed solely as a sentinel
   must never be dereferenced as page content. Avoid forming an unsafe pointer
   before its address is proved to lie within the underlying allocation.
-- **Logical extent.** Check row/count conversions and `count+1` before use.
-  If width is positive, `count <= available/width` bounds the physical
-  column and makes any necessary once-per-row scan proportional to encoded
-  bytes. If width is zero, there are no per-row bytes: validate the constant
-  once, including a delta base, without looping over the logical count.
-  Construction does not prove a subsequent caller-supplied index: `At(row)`
-  requires `0 <= row < count`; `At2` and other adjacent reads also require
-  `row+1 < encodedCount`, without overflowing the index expression.
+- **Logical extent.** Check row/count conversions, including independent
+  counts in custom headers, and `count+1` before use. Positive-width
+  `count <= available/width` bounds the physical column; a dependent-offset
+  scan, when chosen, is O(rows) per initialization. Width zero has no per-row
+  bytes: check the constant (including a delta base) once, never loop over
+  an unencoded logical count. `At(row)` still requires `0 <= row < count`;
+  adjacent reads need both indexes valid without overflowing the addition.
 - **Cross-column extent.** Validate offset monotonicity, summary-bit targets,
   bundle/prefix relationships and keyspan boundary indices against the
   columns they will index before exposing their unchecked accessors. A final
   offset does not establish that intermediate offsets are ordered.
-- **Output extent.** Check the sum of all component lengths *without
-  narrowing or overflow*, then slice the actual destination to the required
-  size before built-in unsafe stores, including synthetic bytes. A header
-  estimate can bound an allocation after normalization; it cannot justify
-  a write beyond the allocated buffer. Existing registered `KeySchema`
-  implementations are trusted code processing untrusted fields, with a
-  public contract that the caller supplies enough capacity for the key and
-  synthetic-suffix replacement. A generic view cannot certify arbitrary
-  third-party unsafe code; preserve that capacity promise for old schemas
-  while enforcing built-in materializers' actual-write bounds.
-- **Lifetime and mutability.** A directly initialized decoder borrows
-  immutable bytes until its last view is discarded; a handle-backed iterator
-  pins the buffer until replacement or `Close`. A handle prevents recycling,
-  *not* writes through another alias. Require exclusive ownership or an
-  immutable borrow at entry; if that cannot be enforced, copy at the affected
-  boundary. Mutation requires exclusive access and invalidation of every old
-  view before revalidation, never concurrent aliasing. Do not store a pointer
-  to a separately allocated descriptor in opaque block metadata: the GC
-  cannot trace such a pointer. Enlarging block metadata may change cache
-  allocation size classes even if allocs/op stays constant.
+- **Output extent.** Check sums of component lengths without narrowing or
+  overflow, then slice the actual destination before built-in unsafe stores,
+  including synthetic bytes. A header maximum is an allocation hint, not
+  evidence that a store fits. Registered `KeySchema` implementations are
+  trusted code acting on untrusted block fields. The current public
+  `KeySeeker` contract promises a sufficiently large caller buffer; old
+  custom schemas may expand beyond the encoded block. Built-ins must check
+  their actual writes, but an arbitrary custom unsafe seeker is not covered
+  until a capacity contract and migration path are agreed; do not claim
+  engine-wide safety for such schemas in the meantime.
+- **Lifetime and mutability.** Cached decoder metadata shares its block's
+  allocation and is live only while the handle is retained; direct `Init`
+  borrows the caller's bytes until the last view is discarded. For example,
+  the uncompressed aligned suffix-rewriter path can decode a block aliasing
+  its caller's slice. Neither a handle nor a checked constructor prevents
+  mutation through another alias. Require immutability while a view is live;
+  an entry point that cannot enforce this may need an owned copy. Mutation
+  requires exclusive access and invalidation of *all* old views before
+  revalidation. Do not put pointers to separate allocations into opaque
+  metadata that the GC cannot trace, and measure cache size classes if
+  metadata grows.
 
-Checksums and decompression precede decoding but do not establish semantic
-validity. Do not turn ordinary `panic` recovery into the safety mechanism:
-the proofs must precede unsafe operations. At the reader boundary, convert
-recoverable decoder assertions to corruption errors with file/block context
-where the existing API supports it. A Go bounds panic is preferable to an
-unsafe memory access; it is still a usability defect when it escapes a public
-read API and should be measured separately.
+The proof lives in the `Decode*`/`Init` constructor shared by cached, direct,
+and lazy callers; it cannot rely on a metadata callback having run. An
+optional or nested decoder proves its own fields before first use. A failed
+constructor must not publish a cache value, set a lazy-ready flag, or let
+callers reuse a partial view. Keep the current decoder assertion style;
+convert panics to contextual corruption errors at applicable API boundaries,
+auditing direct call sites separately. Recovery cannot undo an unsafe access,
+and a Go bounds panic is preferable to one but not a reason to keep reading.
+
+## Choosing a validation tool
+
+| Field/use | Default tool | When to choose another |
+| --- | --- | --- |
+| Fixed header and page table | Eager checked arithmetic in `BlockDecoder.Init`, O(columns). | None if the fields select later pointer addresses. |
+| Physical column | Check its complete extent in its `Decode*` constructor, once per constructed view. | A lazy column runs the same constructor at first use, not on every iterator step. |
+| Dependent offsets or indexes | Validate relationships once before unchecked consumers; zero-width constants stay O(1). | If a positive-width O(rows) scan costs more on cold reads, prove each access with checked consumers and benchmark both designs. |
+| Optional nested payload | Decode and memoize on first use under the owning handle/borrow. | Validate eagerly only if all readers need it and cold-read cost warrants it. |
+| Materialized output | Check the real destination before each unsafe write, with length arithmetic checked first. | Use a safe slice/copy when a proof is harder to maintain than its measured cost. |
+| Allocation from encoded length | Validate representability and known format bounds before allocating. | Additional resource limits need writer-compatibility evidence; no arbitrary count-to-compressed-size clamp. |
+
+For each migrated family, record the first unchecked use, owning constructor
+or consumer, validation timing, buffer lifetime, failure path, and cold/warm
+cost. This is a review aid, not a runtime descriptor or a new public API.
 
 ## Proposed factoring, without per-row overhead
 
-Start with a **package-local, allocation-free checked-range vocabulary**, not
-a new public decoding framework. One helper checks an untrusted `(off, size)`
-against a buffer length and returns `int` endpoints only after proving the
-conversion fits. Another checks element count against width and remaining
-bytes, with an explicit width-zero branch. Make the failure text name the
-field and page. Keep the resulting bounds in existing decoder state, or in a
-small unexported page descriptor when it avoids duplicate checks; benchmark
-any descriptor allocation or extra header load before choosing a shape.
+Start with a small package-local range check: compare offset with the slice
+length, then size with the remaining bytes, before adding or narrowing.
+The proved slice bounds also establish that the result fits `int`. Use
+existing decoder assertions rather than an error-returning wrapper around
+every hot operation. An exclusive end permits an empty slice, but not
+`&buf[end]` without an actual padding or adjacent sentinel byte; alignment
+remains relative to the original block.
 
-For example (illustrative API, **not** a prescriptive signature):
-
-```go
-func checkedRange(bufLen, off, size uint64) (start, end int, err error) {
-    if off > bufLen || size > bufLen-off || off+size > uint64(maxInt) {
-        return 0, 0, errCorruptExtent
-    }
-    return int(off), int(off + size), nil
-}
-```
-
-The implementation should use the repository's error style and avoid interface
-boxing or formatting on success. `maxInt` here means the target architecture's
-`int` maximum. A `start == len(buf)` result is a valid empty slice, not a
-license to take `&buf[start]`; an actual sentinel byte and alignment measured
-from the original block are explicit caller obligations.
-
-Make validated-view construction the only path that can populate an unsafe
-accessor. Keep `UnsafeUints.At`, `RawBytes.At` and other proven accessors
-unchecked in the hot loop; document the row-index preconditions for callers.
-If a direct constructor remains necessary for a writer or a test, identify
-its separate precondition. Review `uintptr` pointer arithmetic and
-`unsafe.Slice` construction at those constructors: do not create a pointer
-outside an allocation and assume a later slice will catch it. Validate
-optional lazily decoded columns before their first use, and nested payloads
-at their own decoder; initial metadata validation cannot prove those bytes.
-
-The first implementation PR should prove this factoring on one column family
-and measure it. It should *not* migrate every format in the same commit. If a
-single generic abstraction costs more or obscures the format-specific proof,
-keep the small arithmetic helpers and explicit local checks instead.
+Keep checks in existing `Init`/`Decode*` constructors and the dependent
+consumer that owns the invariant. Keep proven `UnsafeUints.At` and
+`RawBytes.At` fast, but make row-index preconditions explicit at their
+callers. Do not add a cached descriptor or per-column allocation by default:
+opaque metadata cannot trace separate pointers and even a larger inline
+descriptor can change cache allocation size classes. If a shared helper
+obscures a format-specific proof or costs more, retain a few direct checks.
+Comments belong on non-obvious contracts (sentinel, lifetime, width-zero,
+unchecked accessor), with tests carrying the malformed-input examples.
 
 ## Materialization and resource policy
 
@@ -196,75 +191,86 @@ sized from a logical span length may still exhaust memory without addressing
 outside an allocation. The same distinction applies to a decompressor-reported
 output size and block-handle-derived read size.
 
-Inventory every allocation driven by encoded fields and decide whether its
-bound comes from a verified byte extent, a schema-specific expansion bound, or
-an explicit, documented resource policy. For policies that could reject valid
-historical blocks, collect writer-produced and real-workload distributions and
-propose the limit separately, with a compatibility and operator-error story.
-Do not silently smuggle an arbitrary fixed maximum into `checkedRange`.
+Inventory allocations driven by encoded fields: verified byte extent,
+schema-specific expansion and decompressor output are different bounds.
+Reject unrepresentable sizes before allocating. Limits on valid compressed
+output, block handles or logical span materialization need writer and
+historical-file evidence plus an operator-visible failure mode. They are a
+resource-policy track, not an arbitrary maximum hidden in a bounds helper.
 
-# Proposed PR stack
+# Proposed upstream PR stack
 
-| Slice | Change and acceptance | Where checks run |
+The RFC and its proof matrix are the design slice; they do not gate a fix.
+The fork topic is prior art, not an already-landed upstream slice. Port only
+the relevant changes onto master, adapting its different decoder signatures.
+Each implementation PR stands alone with its own malformed and valid-writer
+tests, baseline, and benchmark where it changes a hot path.
+
+| PR | Independently useful change | Required check |
 | --- | --- | --- |
-| 0. Near-term baseline | Land/review the existing columnar bounds and materializer repairs separately; preserve their valid-writer and canary regressions. | Current topic and v2 integration line; no format change. |
-| 1. Map the first proof | Correct the pinned baseline, document a compact boundary matrix for one column family and its immediate callers (physical extent, row/index ownership, borrow lifetime, output). Record direct and handle-backed call paths; widen the inventory in follow-up PRs. | Design/review only; no runtime behavior change. |
-| 2. Prove a physical column | Add tested, allocation-free checked ranges/counts and migrate the common header and one physical unsigned-integer family on an explicit baseline (reuse the topic if accepted). Cover empty/adjacent pages, real final padding, alignment, integer casts, width-zero delta bases, and checked `count+1`. | Once per decoded page, not per `At`; lazy columns validated before first use. |
-| 3. Prove one built-in output | Give a built-in schema/iterator an actual-destination check before unsafe writes. Test valid excluded keys, an expanding schema fixture, synthetic suffix and exact-fit/canary output. Preserve registered schemas' capacity contract; defer new public interfaces. | At the materializer's output boundary, with scratch state per iterator. |
-| 4. Extend the inventory | Migrate data, index, keyspan, key/value and liveness columns, then row SST blocks, footer/handles and decompression, value/blob, WAL/MANIFEST and batch inputs one format per PR. Include nested payloads and direct entry points; apply the same obligations, not necessarily the same types. A narrow review checklist may precede a mechanical checker, but no global unsafe-site lint is a prerequisite. | At each format's first read, optional lazy decode or nested decoder boundary. |
-| 5. Resource policy | Investigate decompressed sizes, logical row/span materialization and large block handles separately. Adopt limits only with writer compatibility evidence and an explicit operator-facing policy. | Before expensive allocation; independent from memory-safety proof. |
+| 1. Output capacity | Normalize `maximumKeyLength` as an allocation hint without rejecting valid excluded keys; check synthetic-length sums before narrowing and the actual destination before built-in MVCC unsafe stores. Leave third-party schema API decisions explicit. | Exact-fit and restricted-capacity canaries, both synthetic suffix lengths, excluded long key written/read through an iterator; no new per-row scan. |
+| 2. Physical structure | Prove the common header/page starts once in `BlockDecoder.Init`; confine `DecodeColumn` to its page and bound complete positive-width integer, bitmap and prefix physical extents before constructing unsafe views. Keep zero-row padding and alignment explicit. | Direct and metadata-cache paths, empty/adjacent pages, delta base, width-zero, malformed header/summary, and header/uint init benchmarks. |
+| 3. Dependent relationships | Bound raw-byte offsets, keyspan indexes and blob-index remaps at their owning constructors or dependent consumers. For positive-width offsets, compare a one-time O(rows) scan against checked consumers before choosing; constants remain O(1). | Reproducible cold-cache read and warm-iterator benchmarks, safe-reference decoded rows, cross-column mutation fixtures. |
+| Follow-ups | Cover first-use tiering and nested payloads, direct liveness/properties/suffix-rewriter paths, and error conversion by call site. Add constructor fuzz targets and extend to row blocks/WAL/MANIFEST with format-specific notes rather than a blanket decoder rewrite. | Preserve each path's existing API contract and report any new rejection. |
+| Resource track | Audit decompressed lengths, block handles, logical span allocations and format-derived count limits. Adopt policies only after valid-writer compatibility measurements. | Fail before expensive allocation without rejecting supported files by assumption. |
 
-The stack is ordered for review, not a mandate to land every later slice before
-shipping slice 0. Upstream master is the source of truth. Backport only accepted,
-relevant slices to the v2 consumer line while it exists; track fork maintenance
-and exit separately. Never turn a code review or CI result into automatic
-merge authority.
+If the hotfix lands upstream first, reuse its tested checks and submit only the
+remaining work rather than duplicating them. Backport relevant landed slices
+to the v2 consumer line only while necessary; track fork maintenance and exit
+separately. Code review and technical CI never grant merge authority.
+
+Error conversion is separate from the memory-safety proof:
+
+| Entry path | Current reader behavior | Proposed policy |
+| --- | --- | --- |
+| Cached columnar data/index/keyspan | Metadata init runs at block load and recovers decoder panics as corruption. | Keep contextual errors; the constructors still prove bounds for direct callers. |
+| Direct `Init`/`Decode*`, including suffix rewriting and liveness | Can run without a reader metadata callback or its recovery. | Establish proof in that same constructor; document/assert or wrap at the public call site, without continuing after failure. |
+| Lazy tiering or nested key/value payload | Decodes after surrounding block initialization, sometimes from a direct borrow. | Validate before first use, memoize only on success, and handle failure at that caller's API boundary. |
+| Metaindex, filter, value or blob-reference liveness block reads | Some block reads use a no-op metadata initializer. | Validate in each actual consumer; a checksum and successful cache insert are not a decoded-view proof. |
 
 # Validation and performance plan
 
-For each slice, record the source base and a small matrix of **valid writer
-output**, **historical output**, **one-field mutations** and **compressed edge
-cases**. Distinguish direct-constructor rejection, a contextual reader error,
-and a writer round trip. For accepted fixtures compare decoded row values with
-a safe reference; after metadata success exercise row and seek operations,
-synthetic transforms and optional lazy columns. Each unsafe write regression
-needs a bounded-capacity canary when a post-write panic would otherwise make
-the test vacuous. Avoid emitting bytes from outside the fixture into test logs.
-Retain a reproducible offline corpus of real malformed blocks without
-credentials or external calls.
+For each PR, pair valid writer and historical output with focused field
+mutations. Distinguish constructor rejection, contextual reader error, and
+successful writer round trip. For accepted fixtures compare decoded rows
+with a safe reference and exercise seeks, synthetic transforms, and optional
+first-use paths. A canary around a restricted output buffer catches a
+store-before-slice regression that a later panic would conceal. Run those
+tests in default as well as invariants builds; never print bytes outside
+the fixture.
 
-- Deterministic tests: min/max offset, overflow at each width, positive-width
-  truncated pages, zero-width delta base and empty columns, nonmonotone
-  intermediate offsets, cross-column indexes, valid excluded keys, an
-  expanding registered schema and exact-fit destination buffers. Exercise
-  direct, handle-backed and optional-tiering-first-use paths. Check legacy
-  writer compatibility, not just malformed-input rejection. Test 32-bit
-  casts where supported.
-- Fuzz separately by format: generic columns, data (including custom
-  `KeySchema`), index, keyspan, key/value and liveness, row blocks, value/blob,
-  WAL, MANIFEST and batch as their slices land. Use writer-produced seeds and
-  targeted mutations of headers, widths, offsets, counts and dependent fields.
-  Bound harness inputs/iterations to avoid a fuzz-time resource denial. Go
-  `checkptr=2`, invariants, and canaries are complementary; accepting a Go
-  bounds panic is **not** proof that an unchecked pointer was safe.
-- Benchmark against a pinned base on the same runner, repeated interleaved
-  runs with `benchstat`, `-benchmem` and CPU profiles on meaningful changes.
-  Start with existing `BenchmarkDataBlockDecoderInit`,
-  `BenchmarkDataBlockIter` (seek/next/prev), `BenchmarkRawBytes`,
-  `BenchmarkUnsafeUints`, `BenchmarkKeyspanBlock_RangeDeletions` and SST reader
-  seek/scan benches. Measure cold validation, repeated warm-handle Init,
-  optional tiering first use and steady-state iteration both with and without
-  transforms. Hold encoded width-zero bytes fixed while varying the logical
-  count; include an ordinary block read for validation overhead. Report ns/op,
-  B/op, allocs/op, throughput and cached bytes/block or allocator size class;
-  specify sample size and noise before deciding a regression.
-- Performance acceptance: no added allocation on steady-state decoding or
-  iteration, and no per-row check introduced solely to establish a proof that
-  can be made once. Treat a reproducible hot-path slowdown as a design
-  checkpoint, not a fixed percent to waive by fiat. Prefer removing repeated
-  validation work (e.g. one check for a constant encoding) to offset new
-  one-time checks. Validate representative end-to-end workload throughput
-  before claiming improvement.
+- Cover empty/adjacent pages and their real padding byte, width-zero uints
+  and offsets with a large logical count, truncated positive widths, invalid
+  bitmap encoding/summary, custom-header counts, nonmonotone offsets and
+  cross-column indexes. Test both direct and handle-backed construction,
+  and old writer-produced blocks; use 32-bit and both endian accessor
+  implementations where the test infrastructure supports them.
+- Upstream master at the pinned base has no Go `Fuzz*` targets. Add small
+  fuzz targets at each constructor boundary (including direct/lazy paths),
+  seeded with writer-produced blocks and mutated widths, counts, offsets and
+  nested fields. Follow the first three PRs with format-specific targets for
+  row blocks, blob/value handles, WAL, MANIFEST and batches. Agree on corpus
+  ownership and CI time budget with maintainers. Bound each fuzz input's
+  materialization work; `checkptr=2`, invariants and canaries complement,
+  but cannot replace, a reviewable unsafe-access proof.
+- Benchmark against a pinned base on the same runner, interleaving repeated
+  runs with `benchstat`, `-benchmem` and profiles for material changes.
+  Existing `BenchmarkDataBlockDecoderInit`, `BenchmarkDataBlockIter`,
+  `BenchmarkRawBytes`, `BenchmarkUnsafeUints` and
+  `BenchmarkKeyspanBlock_RangeDeletions` cover useful steady-state paths.
+  Add a cold-cache block-load benchmark that forces metadata initialization:
+  positive-width offset validation is O(rows) *per cache miss*, potentially
+  the dominant new cost. Compare it with checked-consumer access and with a
+  warm handle; isolate optional tiering first use and transforms. Hold
+  width-zero encoded bytes constant while varying claimed rows to catch
+  accidental O(rows) initialization. Record ns/op, B/op, allocs/op,
+  throughput and cache bytes/block or size class, with sample size/noise.
+- Preserve iteration speed and avoid extra steady-state allocations. Prefer
+  a one-time check when it amortizes; allow a measured checked-consumer
+  alternative when the cold-read scan is worse. No decoder initialization
+  loop may scale with an unencoded width-zero logical count. Treat a repeatable
+  slowdown as a design checkpoint and verify an end-to-end workload before
+  claiming an improvement.
 
 # Compatibility, rollout, and alternatives
 
@@ -279,9 +285,9 @@ Alternatives considered:
 
 - **Only fuzz and patch each crash:** useful discovery, but leaves proofs and
   ownership scattered and permits the same class of mistake elsewhere.
-- **Use safe slice indexing for every accessor:** straightforward but may make
-  the hottest iteration path slower; retain it as a fallback when a one-time
-  proof cannot be made convincingly.
+- **Safe indexing at dependent consumers:** a viable alternative to the
+  O(rows) offset scan for sparse access; compare cold and warm workloads.
+  Do not bounds-check every hot accessor by default.
 - **Treat checksummed or writer-produced bytes as trusted:** checksums detect
   accidental changes, not format validity; valid writer output has edge cases
   that simplified assumptions can reject.
@@ -291,17 +297,21 @@ Alternatives considered:
 - **Recover all panics:** cannot undo an unsafe access and can obscure bugs;
   recover only at known error boundaries after the memory-safety invariant is
   established.
+- **One universal `ValidatedBlock` type or global panic recovery:** neither
+  proves nested schema-specific relationships or repairs an unsafe access.
+  Prefer a small local range helper and the existing constructors.
 
 # Open questions for reviewers
 
-1. What minimum internal API shape makes validated view construction obvious
-   without allocating a descriptor per column or adding work to hot accessors?
-2. How do we express third-party `KeySchema` capacity and expansion obligations
-   without assuming all keys are bounded by block bytes?
-3. Which buffer ownership paths (cache, mmap, externally constructed readers)
-   can mutate bytes after metadata initialization or retain a view past release?
-4. Which format-derived allocations need an independent resource policy, and
-   what historical/writer corpus would justify a limit without false positives?
-5. Which benchmarks and machine setup are sufficiently stable to gate each
-   slice, and what low-overhead inventory check would catch a new unchecked
-   accessor lacking a proof?
+1. When do eager offset scans beat checked consumers on representative
+   cache-miss workloads? Which exact callers can be proved safe either way?
+2. What compatible contract can require custom `KeySeeker` implementations
+   to check real output capacity before unsafe stores? Would an optional
+   schema-specific expansion bound or a test-only conformance helper suffice?
+   Until resolved, the engine-wide guarantee excludes arbitrary custom code.
+3. Which direct borrowed-slice paths, beginning with suffix rewriting, can
+   guarantee immutability for the lifetime of every view?
+4. Which format-derived allocations need a separate resource limit, and
+   which writer/historical files support that decision?
+5. Who owns the first constructor fuzz corpus and CI budget? Which small
+   benchmark set can detect cold-read, lazy-first-use and warm-iterator costs?
