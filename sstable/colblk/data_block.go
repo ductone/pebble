@@ -1107,13 +1107,9 @@ func (d *DataBlockDecoder) Init(schema *KeySchema, data []byte) BlockDecoder {
 	d.isValueExternal = bd.Bitmap(len(schema.ColumnTypes) + dataBlockColumnIsValueExternal)
 	d.isObsolete = bd.Bitmap(len(schema.ColumnTypes) + dataBlockColumnIsObsolete)
 	d.maximumKeyLength = binary.LittleEndian.Uint32(data[schema.HeaderSize:])
-	// Every byte of a user key comes from columns in this block. A larger
-	// claimed maximum cannot describe a real key and would allocate an
-	// arbitrarily large iterator buffer from a small corrupt block.
-	if uint64(d.maximumKeyLength) > uint64(len(data)) {
-		panic(errors.AssertionFailedf("maximum key length %d exceeds data block length %d",
-			errors.Safe(d.maximumKeyLength), errors.Safe(len(data))))
-	}
+	// A key omitted by a block flush may still contribute to the recorded
+	// maximum. Clamp it to the block size before allocating an iterator buffer.
+	d.maximumKeyLength = uint32(min(uint64(d.maximumKeyLength), uint64(len(data))))
 	return bd
 }
 
