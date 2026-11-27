@@ -77,9 +77,15 @@ func (h HandleWithProperties) EncodeVarints(dst []byte) []byte {
 // which will be false if the properties are not decoded. In those cases the
 // caller should use DecodeHandleWithProperties.
 func DecodeHandle(src []byte) (Handle, int) {
+	// binary.Uvarint returns n == 0 if src is too short and n < 0 if the value
+	// overflows a uint64. Either must be rejected before slicing src, since
+	// src[n:] panics for negative n.
 	offset, n := binary.Uvarint(src)
+	if n <= 0 {
+		return Handle{}, 0
+	}
 	length, m := binary.Uvarint(src[n:])
-	if n == 0 || m == 0 {
+	if m <= 0 {
 		return Handle{}, 0
 	}
 	return Handle{Offset: offset, Length: length}, n + m

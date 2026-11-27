@@ -629,6 +629,15 @@ func TestReadFooter(t *testing.T) {
 		{encode(TableFormatRocksDBv2, 0)[1:], "footer too short"},
 		{encode(TableFormatRocksDBv2, block.ChecksumTypeNone), "unsupported checksum type"},
 		{encode(TableFormatRocksDBv2, block.ChecksumTypeXXHash), "unsupported checksum type"},
+		// Block handles whose offset (first) varint overflows a uint64.
+		{strings.Repeat("\xff", levelDBFooterLen-magicLen) + levelDBMagic, "bad metaindex block handle"},
+		{"\x00\x00" + strings.Repeat("\xff", levelDBFooterLen-magicLen-2) + levelDBMagic, "bad index block handle"},
+		// Block handles whose length (second) varint overflows a uint64. Before
+		// the fix, DecodeHandle returned a negative length for these: the
+		// metaindex case then sliced the footer with it, and the index case was
+		// accepted as a zero-length handle.
+		{"\x00" + strings.Repeat("\xff", levelDBFooterLen-magicLen-1) + levelDBMagic, "bad metaindex block handle"},
+		{"\x00\x00\x00" + strings.Repeat("\xff", levelDBFooterLen-magicLen-3) + levelDBMagic, "bad index block handle"},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
