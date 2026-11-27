@@ -105,18 +105,21 @@ rules apply to a *validated view*, not to an arbitrary `[]byte`:
 - **Cross-column extent.** Validate offset monotonicity, summary-bit targets,
   bundle/prefix relationships and keyspan boundary indices against the
   columns they will index before exposing their unchecked accessors. A final
-  offset does not establish that intermediate offsets are ordered.
-- **Output extent.** Check sums of component lengths without narrowing or
-  overflow, then slice the actual destination before built-in unsafe stores,
-  including synthetic bytes. A header maximum is an allocation hint, not
-  evidence that a store fits. Registered `KeySchema` implementations are
-  trusted code acting on untrusted block fields; Pebble currently promises
-  their `KeySeeker` a sufficiently large caller buffer. Do not shrink that
-  buffer below its recorded maximum for a valid custom schema without a
-  proved schema-specific expansion bound. Built-ins must check actual writes,
-  but arbitrary custom unsafe code is not covered until a compatible
-  capacity contract and migration path are agreed. Do not claim engine-wide
-  safety for those schemas yet.
+  offset does not establish that intermediate offsets are ordered. For
+  remapped values, distinguish the physical block's rows from the virtual
+  block's interval; a neighbouring mapping may imply the latter bound.
+- **Output extent.** Prove `start <= end` before subtracting untrusted
+  offsets, then sum component lengths without narrowing or overflow. Slice
+  the actual destination before every built-in unsafe store, including
+  synthetic bytes and `SetNext` transitions. A header maximum is an
+  allocation hint, not evidence that a store fits. Registered `KeySchema`
+  implementations are trusted code acting on untrusted block fields; Pebble
+  currently promises their `KeySeeker` a sufficiently large caller buffer.
+  Do not shrink that buffer below its recorded maximum for a valid custom
+  schema without a proved schema-specific expansion bound. Built-ins must
+  check actual writes, but arbitrary custom unsafe code is not covered until
+  a compatible capacity contract and migration path are agreed. Do not claim
+  engine-wide safety for those schemas yet.
 - **Lifetime and mutability.** Cached decoder metadata shares its block's
   allocation and is live only while the handle is retained; direct `Init`
   borrows the caller's bytes until the last view is discarded. For example,
@@ -150,9 +153,11 @@ and a Go bounds panic is preferable to one but not a reason to keep reading.
 
 For each migrated family, record the first unchecked use, owning constructor
 or consumer, validation timing, lifetime, failure path, and cold/warm cost.
-Prove any bound derived from encoded bytes in production; retain
-invariants-only checks for programmer misuse. This is a review rule, not a
-runtime descriptor, global recovery mechanism or new public API.
+For each new rejection, show why the writer (including a partial `Finish`) and
+supported older formats cannot emit it. Prove any bound derived from encoded
+bytes in production; retain invariants-only checks for programmer misuse.
+This is a review rule, not a runtime descriptor, global recovery mechanism
+or new public API.
 
 ## Proposed factoring, without per-row overhead
 
@@ -244,12 +249,15 @@ remain the columnar foundation.
    *high* half, so that check never catches a referenced gap. Preserve
    writer-produced gap entries but reject a reference to one before using
    `indexBlockDecoder.BlockHandle`. Prove virtual/physical block indexes and
-   adjacent offset order before their unchecked reads or subtraction;
-   check `ValueID + valueIDOffset` in widened arithmetic against loaded
-   value rows on both cold and cached paths. Exercise a rewritten file
-   with a gap followed by a live block and nonzero value offset, valid
-   repeat fetches and invalid virtual/value IDs; require contextual fetch
-   errors. Benchmark warm fetch compares if they land on that path.
+   adjacent offset order before their unchecked reads or subtraction.
+   Check `ValueID + valueIDOffset` in widened arithmetic against both the
+   loaded physical row count and the virtual interval implied by the next
+   non-gap mapping within that block. Cache the resolved bound with the
+   current virtual ID; measure alternating IDs across long gaps as well as
+   same-ID warm hits before accepting a per-switch gap scan. Exercise a
+   rewritten file with gaps and two live virtual blocks in one physical
+   block, valid repeat fetches and invalid virtual/value IDs; require
+   contextual fetch errors.
 3. **Blob and value-block handle bytes (two independent PRs).** In
    `sstable/blob/handle.go` and `sstable/valblk/valblk.go`, the respective
    preface and suffix decoders load up to four continuation bytes via
@@ -291,14 +299,14 @@ remain the columnar foundation.
    only if it gains more than an O(1) check.
 6. **Bitmap summary targets (after PR 2).** `DecodeBitmap` proves the
    encoded nonzero bitmap's size, but `SeekSetBitGE/LE` can use a
-   summary-selected primary word through unchecked `data.At`. Reject a
-   nonexistent target before the read and set bits beyond `bitCount`
-   in the final primary word; zero encoding remains O(1). Test writer
+   summary-selected primary word through unchecked `data.At`. Reject
+   nonexistent targets and nonzero padding past `bitCount`; zero encoding
+   remains O(1). Full summary equality also prevents a stale clear bit
+   from hiding real rows. The fork PR uses a one-time equality scan rather
+   than a per-seek check: measure that choice at decoder init and on actual
+   cold block loads before treating its cost as negligible. Test writer
    zero/dense/sparse bitmaps at 63/64/65 bits, corrupt tail-summary and
-   padding bits, and forward/reverse seeks. Measure summary-seek and cold
-   decode. A false summary that hides real bits is also malformed, but a
-   full consistency scan is a separately measured semantic decision, not
-   silently covered by the minimal bounds fix.
+   padding bits, and forward/reverse seeks.
 7. **Keyspan boundary indexes (after PRs 2–3).**
    `KeyspanDecoder.Init` decodes separately counted boundary indices;
    `keyspanIter.materializeSpan` uses them to index trailers, suffixes and
@@ -357,6 +365,11 @@ store-before-slice regression that a later panic would conceal. Run those
 tests in default as well as invariants builds; never print bytes outside
 the fixture.
 
+Reuse a package-local writer-fixture mutator or canary helper once multiple
+tests need it; keep the encoded-format oracle visible at each test site. A
+shared fixture helper is not a validated-block type or a substitute for a
+real reader-open test.
+
 - Cover empty/adjacent pages and real padding, width-zero uints and offsets
   with large logical counts, truncated positive widths, bitmap summaries,
   custom-header counts, nonmonotone offsets and dependent indexes. Check
@@ -380,10 +393,14 @@ the fixture.
   Add a cold-cache block-load benchmark that forces metadata initialization:
   positive-width offset validation is O(rows) *per cache miss*, potentially
   the dominant new cost. Compare it with checked-consumer access and with a
-  warm handle; isolate optional tiering first use and transforms. Hold
-  width-zero encoded bytes constant while varying claimed rows to catch
-  accidental O(rows) initialization. Record ns/op, B/op, allocs/op,
-  throughput and cache bytes/block or size class, with sample size/noise.
+  warm handle; isolate optional tiering first use and transforms. In the
+  bitmap PR, full summary equality measured about 0.7 ns per primary word
+  and +7.6% at in-memory `DataBlockDecoderInit`; in-memory reader cold seeks
+  did not resolve an effect within roughly 10–14% noise. This does not
+  measure the later RawBytes scan. Hold width-zero encoded bytes constant
+  while varying claimed rows to catch accidental O(rows) initialization.
+  Record ns/op, B/op, allocs/op, throughput and cache bytes/block or size
+  class, with sample size/noise.
 - Preserve iteration speed and avoid extra steady-state allocations. Prefer
   one-time constructor validation; use per-row checks only after measuring
   a cold-read regression and proving every dependent path. No initialization
