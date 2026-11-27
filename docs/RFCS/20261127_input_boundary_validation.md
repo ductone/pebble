@@ -296,9 +296,11 @@ remain the columnar foundation.
    counts and indexes consumed by `PrefixBytes.SetAt`, `SetNext`,
    `UnsafeFirstSlice` and `Search`. Prove the derived offset indexes in
    representable arithmetic before unchecked access, preserving the
-   block-wide shared prefix stored at offset zero. Determine the actual
-   writer-supported shift range before choosing a cutoff: the writer uses
-   `TrailingZeros32`, so do not reject a valid large bundle by assumption.
+   block-wide shared prefix stored at offset zero. The writer's
+   `TrailingZeros32` encodes shift 32 for a 64-bit bundle size of `1<<32`;
+   the current v2 fork rejects that writer-valid shift. Preserve it on master
+   and test the v2 compatibility change separately. On 32-bit, prove indexes
+   actually dereferenced, not a final partial bundle's unused sentinel.
    Mutate shifts and index counts, test single/partial bundles and duplicate
    keys across boundaries against writer output; benchmark cold decode
    only if it gains more than an O(1) check.
