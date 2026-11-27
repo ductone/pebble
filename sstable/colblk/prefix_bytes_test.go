@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/bits"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -112,6 +113,70 @@ func TestPrefixBytes(t *testing.T) {
 			panic(fmt.Sprintf("unrecognized command %q", td.Cmd))
 		}
 	})
+}
+
+func TestPrefixBytesLargeBundle(t *testing.T) {
+	keys := [][]byte{[]byte("aa"), []byte("ab"), []byte("bb")}
+	encode := func(bundleSize int) []byte {
+		var builder PrefixBytesBuilder
+		builder.Init(bundleSize)
+		for i, key := range keys {
+			shared := 0
+			if i > 0 {
+				shared = crbytes.CommonPrefix(keys[i-1], key)
+			}
+			builder.Put(key, shared)
+		}
+		buf := make([]byte, builder.Size(len(keys), 0)+1)
+		require.Equal(t, uint32(len(buf)-1), builder.Finish(0, len(keys), 0, buf))
+		return buf
+	}
+	buf := encode(4)
+	buf[0] = 32
+	if bits.UintSize == 64 {
+		bundleSize := uint64(1) << 32
+		require.Equal(t, buf, encode(int(bundleSize)))
+	}
+	for _, shift := range []byte{31, 32} {
+		t.Run(fmt.Sprintf("shift=%d", shift), func(t *testing.T) {
+			buf[0] = shift
+			pb, decodedEnd := DecodePrefixBytes(buf, 0, len(keys))
+			require.Equal(t, uint32(len(buf)-1), decodedEnd)
+			for i, key := range keys {
+				require.Equal(t, key, pb.At(i))
+				row, equal := pb.Search(key)
+				require.Equal(t, i, row)
+				require.True(t, equal)
+			}
+			var iter PrefixBytesIter
+			iter.Buf = make([]byte, 0, 3)
+			pb.SetAt(&iter, 0)
+			require.Equal(t, keys[0], iter.Buf)
+			for i := 1; i < len(keys); i++ {
+				pb.SetNext(&iter)
+				require.Equal(t, keys[i], iter.Buf)
+			}
+			f := binfmt.New(buf)
+			tp := treeprinter.New()
+			prefixBytesToBinFormatter(f, tp.Child("prefix-bytes"), len(keys), nil)
+			require.Contains(t, tp.String(), fmt.Sprintf("bundle size: %d", uint64(1)<<shift))
+		})
+	}
+}
+
+func TestPrefixBytesInvalidBundleShift(t *testing.T) {
+	var builder PrefixBytesBuilder
+	builder.Init(2)
+	builder.Put([]byte("aa"), 0)
+	buf := make([]byte, builder.Size(1, 0)+1)
+	builder.Finish(0, 1, 0, buf)
+	for _, shift := range []byte{33, 255} {
+		buf[0] = shift
+		expectCorruptBlock(t, func() { DecodePrefixBytes(buf, 0, 1) })
+	}
+	if bits.UintSize == 32 {
+		expectCorruptBlock(t, func() { DecodePrefixBytes([]byte{32, 0}, 0, 1<<30+1) })
+	}
 }
 
 func TestPrefixBytesRandomized(t *testing.T) {
