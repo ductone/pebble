@@ -13,12 +13,11 @@ the owning decoder: eagerly for a small fixed header, lazily for optional
 payloads, or at an access point when scanning first would cost more. Reuse the
 proof rather than adding bounds checks to every hot-path operation.
 
-On invalid input, stop processing the affected block: return corruption or
-assert before unsafe memory access, without exposing a partial view. This
-series of small changes uses Pebble's existing `Init`/`Decode` structure, keeps
-writer-compatible encodings, and treats allocation limits as a related but
-separate obligation. No on-disk format change or general decoding framework
-is proposed.
+On invalid input, fail at the first proved boundary through the existing
+corruption or assertion path (which may terminate the engine); never expose
+a partial view or read beyond its buffer. This series of small changes uses
+Pebble's `Init`/`Decode` structure and treats allocation limits separately.
+No on-disk format change or general decoder framework is proposed.
 
 # Motivation and scope
 
@@ -52,16 +51,16 @@ Its v2.1.7-based [consumer integration line](https://github.com/ductone/pebble/t
 is separate from the upstream-master PR sequence below: that port must account
 for master's `offset uint64, rows uint32` decoder signatures.
 
-Selected merged upstream changes show the expected scale, not a blanket
-format-validation policy: [#5856](https://github.com/cockroachdb/pebble/pull/5856)
-widened the existing column decoder offset/count types to remove overflow;
-[#4664](https://github.com/cockroachdb/pebble/pull/4664) added narrow
-invariants-only bounds checks around unchecked access; and
-[#4346](https://github.com/cockroachdb/pebble/pull/4346) improved corruption
-reporting at a layer with file context. Invariants-only checks help debug
-Pebble's own misuse, but are not production proof against malformed encoded
-bytes. This proposal extends the existing decoder and reporting idioms; these
-PRs do not imply upstream agreement with a broader policy.
+Merged changes illustrate a local style, not agreement on a new policy:
+[#5856](https://github.com/cockroachdb/pebble/pull/5856) widened decoder
+offsets and added two production bounds checks;
+[#4664](https://github.com/cockroachdb/pebble/pull/4664) added
+invariants-only caller checks; [#5093](https://github.com/cockroachdb/pebble/pull/5093)
+removed a pointer to save per-block metadata; and
+[#4346](https://github.com/cockroachdb/pebble/pull/4346) improved
+corruption reporting with file context. Invariants checks catch programmer
+misuse, but do not prove encoded extents in production. The proposed checks
+extend the existing decoder idiom without changing global reporting.
 
 ## First proof matrix: unsigned columns
 
@@ -79,25 +78,6 @@ Each implementation PR should extend it only for the consumers it migrates.
 The metadata callbacks recover initialization panics as corruption, but they
 cannot undo an unsafe access. An optional lazily decoded column has its own
 first-use proof even when the surrounding block was cached successfully.
-
-Goals:
-
-1. For every decoder path in scope, stop on malformed extents before an unsafe
-   access; never expose a partially validated view.
-2. Validate at construction when a reusable proof pays off; allow first-use or
-   checked-consumer validation when it is both sound and cheaper.
-3. Preserve all writer-produced and supported historical encodings, including
-   zero-width constant columns, legitimate empty columns, and compressed
-   logical row counts disproportionate to encoded bytes.
-4. Make review tractable: a small vocabulary for checked arithmetic and
-   validated views, explicit ownership of each invariant, and tests showing
-   both accepted edge cases and rejected malformed ones.
-5. Measure CPU, allocations and throughput against a fixed base for every
-   migration slice. No performance claim without the corresponding result.
-
-Non-goals: changing the SSTable/WAL format, treating checksums as authenticity,
-a blanket `rows <= block bytes` rule, removing all `unsafe`, or promising that
-arbitrary compressed data has a universal cheap materialization bound.
 
 # Boundary contract
 
@@ -163,14 +143,16 @@ and a Go bounds panic is preferable to one but not a reason to keep reading.
 | --- | --- | --- |
 | Fixed header and page table | Eager checked arithmetic in `BlockDecoder.Init`, O(columns). | None if the fields select later pointer addresses. |
 | Physical column | Check its complete extent in its `Decode*` constructor, once per constructed view. | A lazy column runs the same constructor at first use, not on every iterator step. |
-| Dependent offsets or indexes | Validate relationships once before unchecked consumers; zero-width constants stay O(1). | If a positive-width O(rows) scan costs more on cold reads, prove each access with checked consumers and benchmark both designs. |
+| Dependent offsets or indexes | Prefer a one-time scan before unchecked consumers; zero-width constants stay O(1). | Only if cold-read cost is unacceptable, benchmark complete checked-consumer coverage against the scan; per-row checks can hurt hot iteration. |
 | Optional nested payload | Decode at first use under the owning handle/borrow; publish sibling views together only after all succeed. Tiering currently memoizes per iterator, not cache entry. | Warm iterator first use may repeat page validation; benchmark before adding cached metadata or an unchecked reuse path. |
 | Materialized output | Check the real destination before each unsafe write, with length arithmetic checked first. | Use a safe slice/copy when a proof is harder to maintain than its measured cost. |
 | Allocation from encoded length | Validate representability and known format bounds before allocating. | Additional resource limits need writer-compatibility evidence; no arbitrary count-to-compressed-size clamp. |
 
 For each migrated family, record the first unchecked use, owning constructor
-or consumer, validation timing, buffer lifetime, failure path, and cold/warm
-cost. This is a review aid, not a runtime descriptor or a new public API.
+or consumer, validation timing, lifetime, failure path, and cold/warm cost.
+Prove any bound derived from encoded bytes in production; retain
+invariants-only checks for programmer misuse. This is a review rule, not a
+runtime descriptor, global recovery mechanism or new public API.
 
 ## Proposed factoring, without per-row overhead
 
@@ -212,18 +194,18 @@ resource-policy track, not an arbitrary maximum hidden in a bounds helper.
 
 # Proposed upstream PR stack
 
-The RFC and its proof matrix are the design slice; they do not gate a fix.
-The fork topic is prior art, not an already-landed upstream slice. Port only
-the relevant changes onto master, adapting its different decoder signatures.
-Each implementation PR stands alone with its own malformed and valid-writer
-tests, baseline, and benchmark where it changes a hot path.
+This fork RFC is a design and tracking aid, not an upstream policy prerequisite.
+Submit small, independently useful implementation PRs, each with malformed
+and valid-writer tests and a benchmark where a hot path changes. Port only
+the relevant fork-topic changes onto master, adapting its decoder signatures;
+do not ask reviewers to accept the whole architecture before the first fix.
 
 | PR | Independently useful change | Required check |
 | --- | --- | --- |
-| 1. Output capacity | Widen synthetic-length arithmetic before narrowing and check the actual destination before built-in MVCC unsafe stores. Preserve valid registered-schema buffer capacity; defer any downward clamp of `maximumKeyLength` unless a schema-specific bound proves it sound. | Exact-fit and restricted-capacity canaries, both synthetic suffix lengths, and a writer round trip whose reconstructed custom key exceeds block bytes through direct and handle-backed iterators. |
-| 2. Physical structure | Prove the common header/page starts once in `BlockDecoder.Init`; confine `DecodeColumn` to its page and bound complete positive-width integer, bitmap and prefix physical extents before constructing unsafe views. Keep zero-row padding and alignment explicit; publish lazy tiering sibling views atomically after both decode. | Direct and metadata-cache paths, empty/adjacent pages, delta base, width-zero, malformed header/summary, second-tiering-column failure and reinitialization, header/uint init plus warm-cache tiering-first-use benchmarks. |
-| 3. Dependent relationships | Bound raw-byte offsets, keyspan indexes and blob-index remaps at their owning constructors or dependent consumers. For positive-width offsets, compare a one-time O(rows) scan against checked consumers before choosing; constants remain O(1). | Reproducible cold-cache read and per-row warm-iterator benchmarks, safe-reference decoded rows, cross-column mutation fixtures and coverage of every dependent consumer. |
-| Follow-ups | Cover other nested payloads, direct liveness/properties/suffix-rewriter paths, and error conversion by call site. Add constructor fuzz targets and extend to row blocks/WAL/MANIFEST with format-specific notes rather than a blanket decoder rewrite. | Preserve each path's existing API contract and report any new rejection. |
+| 1. Output capacity | Match the existing built-in untyped-suffix idiom: slice the destination before the MVCC suffix stores. Widen synthetic prefix/recorded-max/suffix arithmetic before narrowing, without shrinking valid custom-schema capacity or adding a clamp. | In default builds, test wall-only (+10) and wall+logical (+14) output with exact-fit and restricted-capacity canaries; exercise length overflow in both iterator initializers without huge allocations. |
+| 2. Page and uint extents | Complete the physical checks begun in #5856: validate page starts in `BlockDecoder.Init`, confine `DecodeColumn` before its callback, and bound `DecodeUnsafeUints` before returning an unsafe view. Adapt shared callers; assign lazy tiering views together after both decode, in a small companion commit. | A malformed-block table failing on master, valid writer/old block fixtures, zero-row padding, width-zero/delta base, direct/cached reads, a tiering-second-column failure followed by reinit, `GOARCH=386` build, decoder and warm-tiering first-use benchmarks. |
+| 3. RawBytes offsets | Check monotonicity once in the `RawBytes` constructor before returning unchecked accessors; skip the scan for width-zero constants. A per-row checked-consumer design is fallback only if measured cold misses make the scan unacceptable and *every* dependent path is covered. | Compare a cold block load plus sparse seek with warm `BenchmarkDataBlockIter` reads on the same writer blocks; test nonmonotone offsets, decoded values and contextual cached corruption. |
+| Follow-ups | Handle bitmap/prefix semantic summaries, keyspan indexes and blob remaps in separate small PRs; cover direct and nested/lazy paths and error conversion by call site. Add constructor fuzz targets, then row blocks/WAL/MANIFEST with format-specific notes. | Preserve each path's API contract and report new rejections; do not claim coverage before its own proof lands. |
 | Resource track | Audit decompressed lengths, block handles, logical span allocations and format-derived count limits. Adopt policies only after valid-writer compatibility measurements. | Fail before expensive allocation without rejecting supported files by assumption. |
 
 If the hotfix lands upstream first, reuse its tested checks and submit only the
@@ -240,6 +222,9 @@ Error conversion is separate from the memory-safety proof:
 | Lazy tiering or nested key/value payload | Decodes after surrounding block initialization, sometimes from a direct borrow; the two tiering views are assigned separately and an assertion may escape during iteration. | Validate before first use; decode sibling views into locals and assign together, then handle failure at that caller's API boundary without treating a partial view as ready. |
 | Metaindex, filter, value or blob-reference liveness block reads | Some block reads use a no-op metadata initializer. | Validate in each actual consumer; a checksum and successful cache insert are not a decoded-view proof. |
 
+The existing corruption listener may terminate the process by default; an
+error return or recovered assertion does not promise continued operation.
+
 # Validation and performance plan
 
 For each PR, pair valid writer and historical output with focused field
@@ -251,12 +236,12 @@ store-before-slice regression that a later panic would conceal. Run those
 tests in default as well as invariants builds; never print bytes outside
 the fixture.
 
-- Cover empty/adjacent pages and their real padding byte, width-zero uints
-  and offsets with a large logical count, truncated positive widths, invalid
-  bitmap encoding/summary, custom-header counts, nonmonotone offsets and
-  cross-column indexes. Test both direct and handle-backed construction,
-  and old writer-produced blocks; use 32-bit and both endian accessor
-  implementations where the test infrastructure supports them.
+- Cover empty/adjacent pages and real padding, width-zero uints and offsets
+  with large logical counts, truncated positive widths, bitmap summaries,
+  custom-header counts, nonmonotone offsets and dependent indexes. Check
+  direct/handle paths and old writer output. Build the shared decoder
+  signature changes for `GOARCH=386` as well as the normal target; cover
+  both endian accessor implementations where supported.
 - Upstream master at the pinned base has no Go `Fuzz*` targets. Add small
   fuzz targets at each constructor boundary (including direct/lazy paths),
   seeded with writer-produced blocks and mutated widths, counts, offsets and
@@ -278,11 +263,10 @@ the fixture.
   accidental O(rows) initialization. Record ns/op, B/op, allocs/op,
   throughput and cache bytes/block or size class, with sample size/noise.
 - Preserve iteration speed and avoid extra steady-state allocations. Prefer
-  a one-time check when it amortizes; allow a measured checked-consumer
-  alternative when the cold-read scan is worse. No decoder initialization
-  loop may scale with an unencoded width-zero logical count. Treat a repeatable
-  slowdown as a design checkpoint and verify an end-to-end workload before
-  claiming an improvement.
+  one-time constructor validation; use per-row checks only after measuring
+  a cold-read regression and proving every dependent path. No initialization
+  loop may scale with an unencoded width-zero logical count. Treat a
+  repeatable slowdown as a design checkpoint, not automatic acceptance.
 
 # Compatibility, rollout, and alternatives
 
@@ -293,25 +277,12 @@ recorded error-surface changes. Keep the consumer fork pin reproducible; sync
 only the landed upstream fixes needed by that consumer, and do not confuse
 technical CI with approval, merge or a deployed runtime exercise.
 
-Alternatives considered:
-
-- **Only fuzz and patch each crash:** useful discovery, but leaves proofs and
-  ownership scattered and permits the same class of mistake elsewhere.
-- **Safe indexing at dependent consumers:** a viable alternative to the
-  O(rows) offset scan for sparse access; compare cold and warm workloads.
-  Do not bounds-check every hot accessor by default.
-- **Treat checksummed or writer-produced bytes as trusted:** checksums detect
-  accidental changes, not format validity; valid writer output has edge cases
-  that simplified assumptions can reject.
-- **Clamp every count/size to compressed bytes:** rejects valid zero-width
-  encodings and synthetic-key cases; distinguish physical extent from logical
-  output and allocation policy.
-- **Recover all panics:** cannot undo an unsafe access and can obscure bugs;
-  recover only at known error boundaries after the memory-safety invariant is
-  established.
-- **One universal `ValidatedBlock` type or global panic recovery:** neither
-  proves nested schema-specific relationships or repairs an unsafe access.
-  Prefer a small local range helper and the existing constructors.
+Fuzzing alone discovers cases but does not establish a reusable proof.
+Checksums and writer output do not validate encoded extents; a blanket
+`rows <= len(block)` check rejects valid width-zero columns. Global panic
+recovery cannot undo an unsafe read. Prefer local checks in the existing
+constructors, with checked dependent consumers only when a measured
+constructor scan costs too much and every consumer is covered.
 
 # Open questions for reviewers
 
