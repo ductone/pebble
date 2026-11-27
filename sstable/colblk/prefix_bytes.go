@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
 	"slices"
 	"strings"
@@ -214,12 +215,21 @@ func DecodePrefixBytes(
 	// expressed as log2 of the bundle size (the bundle size must always be a
 	// power of two)
 	bundleShift := uint32(*((*uint8)(unsafe.Pointer(&b[offset]))))
-	if bundleShift >= 32 {
+	if bundleShift > 32 {
 		panic(errors.AssertionFailedf("invalid PrefixBytes bundle shift %d", bundleShift))
+	}
+	if bits.UintSize == 32 && bundleShift >= 31 {
+		// These columns contain a single bundle. Use a representable shift
+		// for the iterator's int-sized bundle boundary.
+		bundleShift = min(bundleShift, uint32(bits.Len32(uint32(count-1))))
+		if bundleShift >= 31 {
+			panic(errors.AssertionFailedf("invalid PrefixBytes bundle shift %d for %d rows", bundleShift, count))
+		}
 	}
 	calc := makeBundleCalc(bundleShift)
 	nBundles := int(calc.bundleCount(count))
-	if uint64(count)+uint64(nBundles) > uint64(^uint32(0))-1 {
+	totalSlices := uint64(count) + uint64(nBundles)
+	if totalSlices >= uint64(math.MaxUint32) || totalSlices >= uint64(math.MaxInt) {
 		panic(errors.AssertionFailedf("PrefixBytes slice count overflow: %d + %d", count, nBundles))
 	}
 
@@ -624,7 +634,7 @@ func prefixBytesToBinFormatter(
 	}
 	pb, _ := DecodePrefixBytes(f.RelativeData(), uint32(f.RelativeOffset()), count)
 
-	f.HexBytesln(1, "bundle size: %d", 1<<pb.bundleShift)
+	f.HexBytesln(1, "bundle size: %d", uint64(1)<<f.RelativeData()[f.RelativeOffset()])
 	f.ToTreePrinter(tp)
 
 	n := tp.Child("offsets table")
