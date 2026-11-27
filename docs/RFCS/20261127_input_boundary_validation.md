@@ -204,6 +204,11 @@ Any future policy for large decompressed output, handles or materialized
 spans needs its own compatibility evidence, limits and failure semantics.
 It should not be hidden in a bounds helper or gate these input-safety PRs.
 
+Keep new validation work on valid inputs distinct from resource limits:
+measure it against representative reads and disclose outliers. A pathological
+slowdown may warrant a separate optimization without weakening the bounds
+proof or adding an arbitrary size cap.
+
 # Proposed upstream PR stack
 
 This fork RFC is a design and tracking aid, not an upstream policy prerequisite.
@@ -401,6 +406,14 @@ real reader-open test.
   while varying claimed rows to catch accidental O(rows) initialization.
   Record ns/op, B/op, allocs/op, throughput and cache bytes/block or size
   class, with sample size/noise.
+  A writer-produced v2 rewritten blob file with two live virtual IDs in one
+  physical block exposes an additional case: alternating IDs replays the
+  next-live gap scan on each switch. In a warm-cache benchmark, 4,096 gaps
+  raised fetch time from about 85 ns to 4.5 µs; 65,536 gaps took about
+  70.6 µs. Ordinary fetches were within 0–3% of baseline; disk cost and
+  the master-branch implementation were not measured. Keep the bounds proof,
+  disclose this case, and compare a one-time/index-lifetime bound with lazy
+  per-switch resolution before changing the cache representation.
 - Preserve iteration speed and avoid extra steady-state allocations. Prefer
   one-time constructor validation; use per-row checks only after measuring
   a cold-read regression and proving every dependent path. No initialization
