@@ -6,7 +6,6 @@ package cockroachkvs
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -134,7 +133,6 @@ func TestMaterializeUserKeyBounds(t *testing.T) {
 			}
 			enc.Add(ikey, nil, block.InPlaceValuePrefix(false), enc.KeyWriter.ComparePrev(key), false)
 			data, _ := enc.Finish(enc.Rows(), enc.Size())
-			binary.LittleEndian.PutUint32(data[KeySchema.HeaderSize:], 0)
 
 			var dec colblk.DataBlockDecoder
 			dec.Init(&KeySchema, data)
