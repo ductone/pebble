@@ -141,6 +141,12 @@ func TestMaterializeUserKeyBounds(t *testing.T) {
 			var ks cockroachKeySeeker
 			ks.init(&dec)
 
+			var exact colblk.PrefixBytesIter
+			exact.Buf = make([]byte, 0, len(key))
+			if got := ks.MaterializeUserKey(&exact, -1, 0); !bytes.Equal(got, key) {
+				t.Fatalf("materialized key %x, want %x", got, key)
+			}
+
 			backing := bytes.Repeat([]byte{0xa5}, 64)
 			var keyIter colblk.PrefixBytesIter
 			keyIter.Buf = backing[:0:2] // One key byte and the iterator's spare byte.

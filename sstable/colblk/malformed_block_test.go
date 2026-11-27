@@ -132,17 +132,21 @@ func TestDataBlockMaximumKeyLengthBound(t *testing.T) {
 	if len(b) >= len(long.UserKey) {
 		t.Fatalf("expected a block shorter than its excluded key: %d >= %d", len(b), len(long.UserKey))
 	}
-	for _, recorded := range []uint32{uint32(len(long.UserKey)), math.MaxUint32} {
-		binary.LittleEndian.PutUint32(b[testKeysSchema.HeaderSize:], recorded)
+	recorded := binary.LittleEndian.Uint32(b[testKeysSchema.HeaderSize:])
+	if recorded <= uint32(len(b)) {
+		t.Fatalf("writer recorded key length %d within block size %d", recorded, len(b))
+	}
+	for _, keyLen := range []uint32{recorded, math.MaxUint32} {
+		binary.LittleEndian.PutUint32(b[testKeysSchema.HeaderSize:], keyLen)
 		var md block.Metadata
 		if err := InitDataBlockMetadata(&testKeysSchema, &md, b); err != nil {
-			t.Fatalf("recorded key length %d: %v", recorded, err)
+			t.Fatalf("recorded key length %d: %v", keyLen, err)
 		}
 		var d DataBlockDecoder
 		d.Init(&testKeysSchema, b)
 		if d.maximumKeyLength != uint32(len(b)) {
 			t.Fatalf("recorded key length %d: bounded length = %d, want %d",
-				recorded, d.maximumKeyLength, len(b))
+				keyLen, d.maximumKeyLength, len(b))
 		}
 	}
 }
