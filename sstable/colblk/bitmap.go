@@ -50,8 +50,8 @@ func DecodeBitmap(b []byte, off uint64, bitCount uint32) (bitmap Bitmap, endOffs
 	sz := bitmapRequiredSize(int(bitCount))
 	endOffset = off + uint64(sz)
 	if endOffset > uint64(len(b)) {
-		panic(errors.AssertionFailedf("bitmap of %d bits requires at least %d bytes; provided with %d-byte slice",
-			errors.Safe(bitCount), errors.Safe(sz), errors.Safe(len(b[off:]))))
+		panic(errors.AssertionFailedf("bitmap of %d bits at offset %d requires %d bytes; provided with %d-byte slice",
+			errors.Safe(bitCount), errors.Safe(off), errors.Safe(sz), errors.Safe(len(b))))
 	}
 	return Bitmap{
 		data:     makeUnsafeUint64Decoder(b[off:], sz>>align64Shift),

@@ -52,6 +52,13 @@ func DecodeUnsafeUints(b []byte, off uint64, rows uint32) (_ UnsafeUints, endOff
 	if w > 0 {
 		off = align(off, uint64(w))
 	}
+	// Accessors use unchecked pointer arithmetic, so every row (and, for a
+	// constant column, the pointer itself) must lie within b before we
+	// construct a pointer.
+	if off >= uint64(len(b)) || uint64(rows)*uint64(w) > uint64(len(b))-off {
+		panic(errors.AssertionFailedf("%d uints of width %d at offset %d extend beyond %d-byte slice",
+			errors.Safe(rows), errors.Safe(w), errors.Safe(off), errors.Safe(len(b))))
+	}
 	return makeUnsafeUints(base, unsafe.Pointer(&b[off]), w), off + uint64(rows)*uint64(w)
 }
 
