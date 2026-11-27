@@ -627,6 +627,9 @@ func TestReadFooter(t *testing.T) {
 		{encode(TableFormatRocksDBv2, 0)[1:], "footer too short"},
 		{encode(TableFormatRocksDBv2, block.ChecksumTypeNone), "unsupported checksum type"},
 		{encode(TableFormatRocksDBv2, block.ChecksumTypeXXHash), "unsupported checksum type"},
+		// Block handles whose varints overflow a uint64.
+		{strings.Repeat("\xff", levelDBFooterLen-magicLen) + levelDBMagic, "bad metaindex block handle"},
+		{"\x00\x00" + strings.Repeat("\xff", levelDBFooterLen-magicLen-2) + levelDBMagic, "bad index block handle"},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
