@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
 	"slices"
 	"strings"
@@ -211,16 +212,22 @@ func DecodePrefixBytes(
 	}
 	// The first byte of a PrefixBytes-encoded column is the bundle size
 	// expressed as log2 of the bundle size (the bundle size must always be a
-	// power of two)
+	// power of two). PrefixBytesBuilder.Init encodes any bundle size of 1<<32
+	// or more as 32.
 	bundleShift := uint32(*((*uint8)(unsafe.Pointer(&b[offset]))))
+	if bundleShift > maxBundleShift {
+		panic(errors.AssertionFailedf("invalid PrefixBytes bundle shift %d", errors.Safe(bundleShift)))
+	}
 	calc := makeBundleCalc(bundleShift)
-	nBundles := uint32(calc.bundleCount(int(count)))
-	totalSlices := count + nBundles
-	if totalSlices < count {
+	nBundles := 1 + uint64(count-1)>>bundleShift
+	// DecodeRawBytes reads totalSlices+1 offsets, and readers index them with
+	// ints up to totalSlices.
+	totalSlices := uint64(count) + nBundles
+	if totalSlices >= math.MaxUint32 || totalSlices > math.MaxInt {
 		panic(errors.AssertionFailedf("overflow in PrefixBytes slice count: %d + %d", errors.Safe(count), errors.Safe(nBundles)))
 	}
 
-	rb, endOffset := DecodeRawBytes(b, offset+1, totalSlices)
+	rb, endOffset := DecodeRawBytes(b, offset+1, uint32(totalSlices))
 	pb := PrefixBytes{
 		bundleCalc: calc,
 		rows:       int(count),
@@ -321,7 +328,7 @@ func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
 		uintptr(rowSuffixLen))
 	// Set nextBundleOffsetIndex so that a call to SetNext can cheaply determine
 	// whether the next row is in the same bundle.
-	it.nextBundleOffsetIndex = bundleOffsetIndex + (1 << b.bundleShift) + 1
+	it.nextBundleOffsetIndex = b.bundleEndOffsetIndex(bundleOffsetIndex)
 }
 
 // SetNext updates the provided PrefixBytesIter to hold the next []byte slice in
@@ -365,7 +372,7 @@ func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
 	// next bundle.
 	bundlePrefixStart := b.rawBytes.offsets.At(it.nextBundleOffsetIndex)
 	bundlePrefixLen := rowSuffixStart - bundlePrefixStart
-	it.nextBundleOffsetIndex = it.offsetIndex + (1 << b.bundleShift)
+	it.nextBundleOffsetIndex = b.bundleEndOffsetIndex(it.offsetIndex - 1)
 
 	it.sharedAndBundlePrefixLen = it.syntheticPrefixLen + uint32(b.sharedPrefixLen) + bundlePrefixLen
 	it.Buf = it.Buf[:it.sharedAndBundlePrefixLen+rowSuffixLen]
@@ -383,6 +390,23 @@ func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
 		ptr,
 		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart)),
 		uintptr(rowSuffixLen))
+}
+
+// bundleEndOffsetIndex returns the offset index of the prefix of the bundle
+// following the bundle whose prefix has offset index i. If there is no such
+// bundle it may instead return any value >= b.rawBytes.slices, which exceeds
+// every row suffix index.
+//
+//gcassert:inline
+func (b *PrefixBytes) bundleEndOffsetIndex(i int) int {
+	if bits.UintSize == 32 {
+		// The index of a bundle past the last one may not fit in an int. If
+		// 1<<bundleShift is less than slices-i, the result is at most slices.
+		if uint64(b.rawBytes.slices-i) <= uint64(1)<<b.bundleShift {
+			return b.rawBytes.slices
+		}
+	}
+	return i + 1<<b.bundleShift + 1
 }
 
 // SharedPrefix return a []byte of the shared prefix that was extracted from
@@ -551,7 +575,17 @@ func (b *PrefixBytes) Search(k []byte) (rowIndex int, isEqual bool) {
 	// Invariant: f(l-1) == false, f(u) == true.
 	k = k[len(bundlePrefix):]
 	l := 1
-	u := min(1<<b.bundleShift, b.rows-(bi-1)<<b.bundleShift)
+	var u int
+	if bits.UintSize == 64 {
+		u = min(1<<b.bundleShift, b.rows-(bi-1)<<b.bundleShift)
+	} else {
+		// On 32-bit platforms 1<<bundleShift fits in an int only if it is less
+		// than the remaining rows.
+		u = b.rows - (bi-1)<<b.bundleShift
+		if uint64(u) > uint64(1)<<b.bundleShift {
+			u = 1 << b.bundleShift
+		}
+	}
 	for l < u {
 		h := int(uint(l+u) >> 1) // avoid overflow when computing h
 		// l ≤ h < u
@@ -624,7 +658,7 @@ func prefixBytesToBinFormatter(
 	start := unsafe.Pointer(&data[off])
 	pb, _ := DecodePrefixBytes(data, uint64(off), uint32(count))
 
-	f.HexBytesln(1, "bundle size: %d", 1<<pb.bundleShift)
+	f.HexBytesln(1, "bundle size: %d", uint64(1)<<pb.bundleShift)
 	f.ToTreePrinter(tp)
 
 	n := tp.Child("offsets table")
@@ -652,7 +686,7 @@ func prefixBytesToBinFormatter(
 	// prefixes and using dots to indicate elided data.
 	for i := 0; i < k-1; i++ {
 		endOff := pb.rawBytes.offsets.At(i + 1)
-		if i%(1+(1<<pb.bundleShift)) == 0 {
+		if uint64(i)%(1+uint64(1)<<pb.bundleShift) == 0 {
 			// This is a bundle prefix.
 			dots = strings.Repeat(".", int(blockPrefixLen))
 			f.HexBytesln(int(endOff-startOff), "data[%02d]: %s%s (bundle prefix)", i+1, dots, sliceFormatter(pb.rawBytes.At(i)))
@@ -1123,6 +1157,10 @@ func (b *PrefixBytesBuilder) WriteDebug(w io.Writer, rows int) {
 	fmt.Fprintf(w, "prefixbytes(%d): %d keys", b.bundleSize, b.nKeys)
 }
 
+// maxBundleShift is the largest bundle shift PrefixBytesBuilder.Init produces:
+// bits.TrailingZeros32 returns 32 for any multiple of 1<<32.
+const maxBundleShift = 32
+
 // bundleCalc provides facilities for computing indexes and offsets within a
 // PrefixBytes structure.
 type bundleCalc struct {
@@ -1154,7 +1192,8 @@ func (b bundleCalc) rowSuffixIndex(row int) int {
 // of a bundle's prefix.
 func (b bundleCalc) bundleOffsetIndexForRow(row int) int {
 	// AND-ing the row with the bundle mask removes the least significant bits
-	// of the row, which encode the row's index within the bundle.
+	// of the row, which encode the row's index within the bundle. The sum,
+	// q*(bundleSize+1) for bundle q, is below the slice count, so it cannot wrap.
 	return int((uint32(row) >> b.bundleShift) + (uint32(row) & b.bundleMask))
 }
 
