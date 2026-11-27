@@ -154,6 +154,18 @@ func testRewrittenFileGap(t *testing.T, cacheSize int64) {
 			require.NoError(t, err, "fetch(%d, %d)", h.b, h.v)
 			require.Empty(t, v, "fetch(%d, %d)", h.b, h.v)
 		}
+		// The end rows of the rewritten file's virtual blocks are computed
+		// once and shared by the file's fetchers: virtual block 0 ends where
+		// virtual block 2 begins in physical block 0, virtual block 1 is a gap
+		// and virtual blocks 2 and 3 extend to the ends of their physical
+		// blocks.
+		endRows := rp.readers[rewrittenFileNum].virtualBlockEndRows.Load()
+		require.NotNil(t, endRows)
+		require.Equal(t, []uint32{3, 0, math.MaxUint32, math.MaxUint32}, *endRows)
+		f2 := newFetcher(rewrittenFileNum)
+		defer func() { require.NoError(t, f2.Close()) }()
+		expectValue(t, f2, 2, 3)
+		require.Same(t, endRows, rp.readers[rewrittenFileNum].virtualBlockEndRows.Load())
 	})
 
 	isCorruption := func(err error) bool { return errors.Is(err, base.ErrCorruption) }
@@ -194,6 +206,11 @@ func testRewrittenFileGap(t *testing.T, cacheSize int64) {
 			errCase{"orig/value-out-of-range", origFileNum, 3, 4, wc, isCorruption},
 		)
 	}
+	defer func() {
+		// The original file was never rewritten, so its end rows are never
+		// computed.
+		require.Nil(t, rp.readers[origFileNum].virtualBlockEndRows.Load())
+	}()
 	for _, c := range cases {
 		name := c.name + "/cold"
 		if c.warm != nil {

@@ -220,24 +220,56 @@ func (d *indexBlockDecoder) virtualBlockMapping(
 	return v & virtualBlockIndexMask, BlockValueID(v >> 32), false
 }
 
+// virtualBlockEndRows computes, in a single pass over the virtual blocks
+// column, the end row of every virtual block's values. A rewritten file
+// records the mappings in ascending virtual block ID order, each with the
+// physical block's value count at the time the virtual block began, so a
+// virtual block's values end where the next non-gap virtual block begins if
+// that virtual block is in the same physical block. In that case the entry is
+// the next virtual block's valueIDOffset; otherwise the virtual block extends
+// to the end of its physical block and the entry is math.MaxUint32, which is
+// never lower than a physical block's row count. Entries for gaps are zero and
+// unused.
+//
+// An entry lower than the virtual block's own valueIDOffset indicates that the
+// next virtual block in the same physical block begins at a lower offset;
+// RemapVirtualBlockID reports it as corruption.
+//
+// REQUIRES: d.virtualBlockCount > 0
+func (d *indexBlockDecoder) virtualBlockEndRows() []uint32 {
+	endRows := make([]uint32, d.virtualBlockCount)
+	var nextPhysicalIndex uint64
+	var nextValueIDOffset BlockValueID
+	haveNext := false
+	for i := d.virtualBlockCount - 1; i >= 0; i-- {
+		physicalIndex, valueIDOffset, gap := d.virtualBlockMapping(i)
+		if gap {
+			continue
+		}
+		endRows[i] = math.MaxUint32
+		if haveNext && nextPhysicalIndex == physicalIndex {
+			endRows[i] = uint32(nextValueIDOffset)
+		}
+		nextPhysicalIndex, nextValueIDOffset, haveNext = physicalIndex, valueIDOffset, true
+	}
+	return endRows
+}
+
 // RemapVirtualBlockID remaps a virtual block ID to a physical block index and a
 // value ID offset. RemapVirtualBlockID should only be called on index blocks
 // with a non-empty virtual blocks column (i.e., index blocks for rewritten blob
 // files). It returns an error if blockID is out of range, refers to a gap (a
-// virtual block with no live values), or maps to an out-of-range physical
-// block index.
+// virtual block with no live values), maps to an out-of-range physical block
+// index, or is followed in its physical block by a virtual block that begins
+// at a lower offset.
 //
-// The returned endRow is an exclusive upper bound on the physical row index of
-// the virtual block's values. A rewritten file records the mappings in
-// ascending virtual block ID order, each with the physical block's value count
-// at the time the virtual block began, so the virtual block's values end where
-// the next non-gap virtual block begins if that virtual block is in the same
-// physical block. Otherwise the virtual block extends to the end of its
-// physical block and endRow is math.MaxUint64.
+// endRows must be the result of d.virtualBlockEndRows(). The returned endRow
+// is an exclusive upper bound on the physical row index of the virtual block's
+// values; it may exceed the physical block's row count.
 //
-// REQUIRES: d.virtualBlockCount > 0
+// REQUIRES: d.virtualBlockCount > 0 && len(endRows) == d.virtualBlockCount
 func (d *indexBlockDecoder) RemapVirtualBlockID(
-	blockID BlockID,
+	blockID BlockID, endRows []uint32,
 ) (blockIndex int, valueIDOffset BlockValueID, endRow uint64, err error) {
 	if uint64(blockID) >= uint64(d.virtualBlockCount) {
 		return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d out of range [0, %d)",
@@ -252,21 +284,10 @@ func (d *indexBlockDecoder) RemapVirtualBlockID(
 		return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d maps to physical block index %d out of range [0, %d)",
 			errors.Safe(blockID), errors.Safe(physicalIndex), errors.Safe(d.bd.Rows()))
 	}
-	endRow = math.MaxUint64
-	for i := int(blockID) + 1; i < d.virtualBlockCount; i++ {
-		nextPhysicalIndex, nextValueIDOffset, nextGap := d.virtualBlockMapping(i)
-		if nextGap {
-			continue
-		}
-		if nextPhysicalIndex == physicalIndex {
-			if nextValueIDOffset < valueIDOffset {
-				return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d has valueID offset %d, preceding offset %d of virtual block ID %d in physical block %d",
-					errors.Safe(i), errors.Safe(nextValueIDOffset), errors.Safe(valueIDOffset),
-					errors.Safe(blockID), errors.Safe(physicalIndex))
-			}
-			endRow = uint64(nextValueIDOffset)
-		}
-		break
+	endRow = uint64(endRows[blockID])
+	if endRow < uint64(valueIDOffset) {
+		return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d with valueID offset %d is followed in physical block %d by a virtual block at offset %d",
+			errors.Safe(blockID), errors.Safe(valueIDOffset), errors.Safe(physicalIndex), errors.Safe(endRow))
 	}
 	// physicalIndex < d.bd.Rows(), so it is representable as an int.
 	return int(physicalIndex), valueIDOffset, endRow, nil

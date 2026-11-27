@@ -233,5 +233,5 @@ index-block-decoder
 
 remap-virtual-blockid 0 1
 ----
-0 -> error: blob: virtual block ID 1 has valueID offset 2, preceding offset 5 of virtual block ID 0 in physical block 0
+0 -> error: blob: virtual block ID 0 with valueID offset 5 is followed in physical block 0 by a virtual block at offset 2
 1 -> block 0, with valueID offset 2

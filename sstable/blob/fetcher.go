@@ -251,6 +251,10 @@ type cachedReader struct {
 		loaded bool
 		buf    block.BufferHandle
 		dec    *indexBlockDecoder
+		// virtualBlockEndRows holds the end rows of the virtual blocks of a
+		// rewritten file (see indexBlockDecoder.virtualBlockEndRows). It is
+		// nil if the file has not been rewritten.
+		virtualBlockEndRows []uint32
 	}
 	// currentValueBlock holds the currently loaded blob value block, if any.
 	currentValueBlock struct {
@@ -299,6 +303,16 @@ func (cr *cachedReader) GetUnsafeValue(
 				return nil, err
 			}
 			cr.indexBlock.dec = block.CastMetadata[indexBlockDecoder](cr.indexBlock.buf.BlockMetadata())
+			if cr.indexBlock.dec.virtualBlockCount > 0 {
+				// The end rows are computed in one pass over the virtual blocks
+				// column, once per open file when the reader is a *FileReader,
+				// so that remapping a virtual block ID below is O(1).
+				if fr, ok := cr.r.(*FileReader); ok {
+					cr.indexBlock.virtualBlockEndRows = fr.getVirtualBlockEndRows(cr.indexBlock.dec)
+				} else {
+					cr.indexBlock.virtualBlockEndRows = cr.indexBlock.dec.virtualBlockEndRows()
+				}
+			}
 			cr.indexBlock.loaded = true
 		}
 
@@ -314,7 +328,8 @@ func (cr *cachedReader) GetUnsafeValue(
 		var endRow uint64 = math.MaxUint64
 		if cr.indexBlock.dec.virtualBlockCount > 0 {
 			var err error
-			physicalBlockIndex, valueIDOffset, endRow, err = cr.indexBlock.dec.RemapVirtualBlockID(vh.BlockID)
+			physicalBlockIndex, valueIDOffset, endRow, err = cr.indexBlock.dec.RemapVirtualBlockID(
+				vh.BlockID, cr.indexBlock.virtualBlockEndRows)
 			if err != nil {
 				return nil, errors.Wrapf(err, "blob file %s", vh.BlobFileID)
 			}
