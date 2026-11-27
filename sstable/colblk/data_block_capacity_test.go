@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/crlib/crbytes"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/testkeys"
@@ -111,8 +112,9 @@ func withMaximumKeyLength(blk []byte, maxKeyLen uint32) []byte {
 // block through one of its two initialization paths.
 type dataBlockIterInitializer struct {
 	name string
-	// init initializes it over blk and returns a cleanup function.
-	init func(t *testing.T, it *DataBlockIter, blk []byte, transforms blockiter.Transforms) (func(), error)
+	// init initializes it over blk. The returned release function frees
+	// resources backing the block; it must run after the iterator is closed.
+	init func(t *testing.T, it *DataBlockIter, blk []byte, transforms blockiter.Transforms) (release func(), _ error)
 }
 
 func dataBlockIterInitializers() []dataBlockIterInitializer {
@@ -122,8 +124,7 @@ func dataBlockIterInitializers() []dataBlockIterInitializer {
 			init: func(t *testing.T, it *DataBlockIter, blk []byte, transforms blockiter.Transforms) (func(), error) {
 				d := new(DataBlockDecoder)
 				bd := d.Init(&testKeysSchema, blk)
-				err := it.Init(d, bd, transforms, NoTieringColumns())
-				return func() { _ = it.Close() }, err
+				return func() {}, it.Init(d, bd, transforms, NoTieringColumns())
 			},
 		},
 		{
@@ -137,12 +138,11 @@ func dataBlockIterInitializers() []dataBlockIterInitializer {
 				v.SetInCacheForTesting(ch, base.DiskFileNum(1), 0)
 				cv := ch.Get(base.DiskFileNum(1), 0, base.MakeLevel(0), cache.CategorySSTableData)
 				require.NotNil(t, cv)
-				err := it.InitHandle(testkeys.Comparer, block.CacheBufferHandle(cv), transforms)
-				return func() {
-					_ = it.Close()
+				release := func() {
 					ch.Close()
 					c.Unref()
-				}, err
+				}
+				return release, it.InitHandle(testkeys.Comparer, block.CacheBufferHandle(cv), transforms)
 			},
 		},
 	}
@@ -183,8 +183,9 @@ func TestDataBlockIterMaterializedKeyCapacity(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					it := newCapacityTestIter()
-					cleanup, err := ini.init(t, it, blk, tc.transforms)
-					defer cleanup()
+					release, err := ini.init(t, it, blk, tc.transforms)
+					defer release()
+					defer func() { _ = it.Close() }()
 					require.NoError(t, err)
 
 					ps := tc.transforms.SyntheticPrefixAndSuffix
@@ -194,31 +195,43 @@ func TestDataBlockIterMaterializedKeyCapacity(t *testing.T) {
 					}
 					wantCap := int(ps.PrefixLen()) + maxKeyLen + int(ps.SuffixLen()) + 1
 					require.GreaterOrEqual(t, cap(it.keyIter.Buf), wantCap)
-
-					i := 0
-					for kv := it.First(); kv != nil; kv = it.Next() {
-						k := []byte(keys[i])
-						want := append([]byte(nil), ps.Prefix()...)
-						if ps.HasSuffix() {
-							want = append(want, k[:testkeys.Comparer.Split(k)]...)
-							want = append(want, ps.Suffix()...)
-						} else {
-							want = append(want, k...)
-						}
-						require.Equal(t, string(want), string(kv.K.UserKey))
-						i++
-					}
-					require.Equal(t, len(keys), i)
+					requireTransformedKeys(t, it, keys, ps)
 				})
 			}
 		})
 	}
 }
 
+// requireTransformedKeys iterates it and requires that it yields keys with the
+// synthetic prefix and suffix applied.
+func requireTransformedKeys(
+	t *testing.T, it *DataBlockIter, keys []string, ps blockiter.SyntheticPrefixAndSuffix,
+) {
+	t.Helper()
+	i := 0
+	for kv := it.First(); kv != nil; kv = it.Next() {
+		require.Less(t, i, len(keys))
+		k := []byte(keys[i])
+		want := append([]byte(nil), ps.Prefix()...)
+		if ps.HasSuffix() {
+			want = append(want, k[:testkeys.Comparer.Split(k)]...)
+			want = append(want, ps.Suffix()...)
+		} else {
+			want = append(want, k...)
+		}
+		require.Equal(t, string(want), string(kv.K.UserKey))
+		i++
+	}
+	require.Equal(t, len(keys), i)
+}
+
 // TestDataBlockIterMaterializedKeyCapacityOverflow verifies that both
 // DataBlockIter initializers reject a recorded maximum key length that, with
 // the synthetic prefix and suffix, wraps the uint32 sum and cannot be addressed
 // by an int, instead of sizing the buffer for the wrapped or narrowed value.
+// The iterator is reinitialized from a valid block, then the corrupt block,
+// then a valid block again, and is then closed, to exercise reuse after a
+// failed initialization.
 //
 // The same operands are addressable on 64-bit platforms, where
 // TestMaterializedKeyCapacity verifies that the exact sum is computed; the
@@ -228,19 +241,130 @@ func TestDataBlockIterMaterializedKeyCapacityOverflow(t *testing.T) {
 	if strconv.IntSize != 32 {
 		t.Skip("requires a 32-bit platform")
 	}
+	keys := []string{"a@1", "b@2"}
+	valid := buildCapacityTestBlock(t, keys)
 	// With a 4-byte prefix and a 10-byte suffix, the uint32 sum wraps to 11.
-	blk := withMaximumKeyLength(buildCapacityTestBlock(t, []string{"a@1", "b@2"}), math.MaxUint32-2)
+	corrupt := withMaximumKeyLength(valid, math.MaxUint32-2)
 	transforms := blockiter.Transforms{
 		SyntheticPrefixAndSuffix: blockiter.MakeSyntheticPrefixAndSuffix([]byte("pfx_"), []byte("@123456789")),
 	}
+	ps := transforms.SyntheticPrefixAndSuffix
 	for _, ini := range dataBlockIterInitializers() {
 		t.Run(ini.name, func(t *testing.T) {
 			it := newCapacityTestIter()
-			cleanup, err := ini.init(t, it, blk, transforms)
-			defer cleanup()
+			var releases []func()
+			defer func() {
+				_ = it.Close()
+				for _, release := range releases {
+					release()
+				}
+			}()
+
+			release, err := ini.init(t, it, valid, transforms)
+			releases = append(releases, release)
+			require.NoError(t, err)
+			requireTransformedKeys(t, it, keys, ps)
+
+			release, err = ini.init(t, it, corrupt, transforms)
+			releases = append(releases, release)
 			require.Error(t, err)
 			require.True(t, base.IsCorruptionError(err), "%v", err)
 			require.True(t, it.IsDataInvalidated())
+			require.False(t, it.Valid())
+			require.Nil(t, it.First())
+
+			release, err = ini.init(t, it, valid, transforms)
+			releases = append(releases, release)
+			require.NoError(t, err)
+			requireTransformedKeys(t, it, keys, ps)
 		})
 	}
+}
+
+// buildCapacityTestPrefixBytes returns a PrefixBytes holding keys in bundles of
+// two.
+func buildCapacityTestPrefixBytes(keys []string) PrefixBytes {
+	var pbb PrefixBytesBuilder
+	pbb.Init(2)
+	for i, k := range keys {
+		shared := 0
+		if i > 0 {
+			shared = crbytes.CommonPrefix([]byte(keys[i-1]), []byte(k))
+		}
+		pbb.Put([]byte(k), shared)
+	}
+	buf := make([]byte, pbb.Size(len(keys), 0)+1 /* +1 to avoid checkptr issues */)
+	pbb.Finish(0, len(keys), 0, buf)
+	pb, _ := DecodePrefixBytes(buf, 0, uint32(len(keys)))
+	return pb
+}
+
+// TestPrefixBytesIterLengthWidth verifies that SetAt and both SetNext paths
+// compute the materialized key length without wrapping, and check it against
+// the buffer's capacity before copying any bytes.
+//
+// A synthetic prefix and key whose lengths sum past math.MaxUint32 would need
+// gigabytes of memory, so the oversized components are simulated by setting
+// the iterator's length fields directly. Computed in uint32, those lengths wrap
+// to a small value that fits the buffer while the copies land gigabytes past it.
+func TestPrefixBytesIterLengthWidth(t *testing.T) {
+	keys := []string{"apple1", "apple2", "banana1", "banana2"}
+	pb := buildCapacityTestPrefixBytes(keys)
+	const capacity = 32
+
+	newIter := func(syntheticPrefix string) (*PrefixBytesIter, []byte) {
+		backing := bytes.Repeat([]byte{0xA5}, capacity+32)
+		it := &PrefixBytesIter{Buf: backing[:0:capacity]}
+		it.Init(capacity-1, blockiter.SyntheticPrefix(syntheticPrefix))
+		require.Equal(t, capacity, cap(it.Buf), "Init must reuse the restricted buffer")
+		return it, backing
+	}
+	requireCanaryIntact := func(t *testing.T, backing []byte) {
+		t.Helper()
+		for i := capacity; i < len(backing); i++ {
+			require.Equal(t, byte(0xA5), backing[i], "byte %d beyond the capacity was overwritten", i)
+		}
+	}
+	panics := func(fn func()) (panicked bool) {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		fn()
+		return false
+	}
+
+	t.Run("ordinary", func(t *testing.T) {
+		it, backing := newIter("pfx_")
+		pb.SetAt(it, 0)
+		require.Equal(t, "pfx_apple1", string(it.Buf))
+		for i := 1; i < len(keys); i++ {
+			pb.SetNext(it)
+			require.Equal(t, "pfx_"+keys[i], string(it.Buf))
+		}
+		pb.SetAt(it, 2)
+		require.Equal(t, "pfx_banana1", string(it.Buf))
+		requireCanaryIntact(t, backing)
+	})
+	t.Run("SetAt", func(t *testing.T) {
+		it, backing := newIter("")
+		it.syntheticPrefixLen = math.MaxUint32 - 2
+		require.True(t, panics(func() { pb.SetAt(it, 0) }))
+		requireCanaryIntact(t, backing)
+	})
+	t.Run("SetNext/same-bundle", func(t *testing.T) {
+		it, backing := newIter("")
+		pb.SetAt(it, 0)
+		it.sharedAndBundlePrefixLen = math.MaxUint32
+		require.True(t, panics(func() { pb.SetNext(it) }))
+		requireCanaryIntact(t, backing)
+	})
+	t.Run("SetNext/new-bundle", func(t *testing.T) {
+		it, backing := newIter("")
+		pb.SetAt(it, 1)
+		it.syntheticPrefixLen = math.MaxUint32 - 2
+		require.True(t, panics(func() { pb.SetNext(it) }))
+		requireCanaryIntact(t, backing)
+	})
 }
