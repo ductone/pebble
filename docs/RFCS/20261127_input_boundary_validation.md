@@ -213,10 +213,13 @@ do not ask reviewers to accept the whole architecture before the first fix.
 | 2. Page and uint extents | Complete the physical checks begun in #5856: validate page starts in `BlockDecoder.Init`, confine `DecodeColumn` before its callback, and bound `DecodeUnsafeUints` before returning an unsafe view. Adapt shared callers; assign lazy tiering views together after both decode, in a small companion commit. | A malformed-block table failing on master, valid writer/old block fixtures, zero-row padding, width-zero/delta base, direct/cached reads, a tiering-second-column failure followed by reinit, `GOARCH=386` build, decoder and warm-tiering first-use benchmarks. |
 | 3. RawBytes offsets | Check monotonicity once in the `RawBytes` constructor before returning unchecked accessors; skip the scan for width-zero constants. A per-row checked-consumer design is fallback only if measured cold misses make the scan unacceptable and *every* dependent path is covered. | Compare a cold block load plus sparse seek with warm `BenchmarkDataBlockIter` reads on the same writer blocks; test nonmonotone offsets, decoded values and contextual cached corruption. |
 
-If the hotfix lands upstream first, reuse its tested checks and submit only the
-remaining work rather than duplicating them. Backport relevant landed slices
-to the v2 consumer line only while necessary; track fork maintenance and exit
-separately. Code review and technical CI never grant merge authority.
+If the hotfix lands upstream first, reuse its tested checks. The master module
+is `github.com/cockroachdb/pebble`, while C1 consumes
+`github.com/cockroachdb/pebble/v2`: master cannot replace the v2 module as a
+drop-in. The existing v2 fork already covers some columnar and bitmap checks;
+port only missing, relevant fixes onto its integration line and test that port
+independently. Track the fork's release delta and exit separately. Code review
+and technical CI never grant merge authority.
 
 ## Source-backed follow-up slices
 
@@ -258,20 +261,23 @@ remain the columnar foundation.
    trips. Decide whether the caller returns an error or a checked panic;
    if an exported signature changes, update all callers. Benchmark valid
    handle-heavy iteration, not just an isolated cold decoder.
-4. **Row-block entry and seek paths (two dependent PRs).** In
-   `sstable/rowblk/rowblk_iter.go`, `Iter.Init` reads a restart footer;
-   `readFirstKey`, `readEntry` and seek/skip loops decode unrolled varints
-   through unchecked pointers, then form `unsafe.Slice` key/value views.
-   First prove footer/restart extents and entry lengths before key/value
-   slices; then cover the separate seek/skip pointer paths before claiming
-   whole-block protection. Test writer blocks with several restart groups
-   and empty blocks, corrupted restart offsets, truncated 1–5-byte
-   varints, too-short internal keys, inflated unshared/value lengths, and
-   forward/reverse/seek behavior with canaries. Preserve the iterator's
-   error contract; compare cold `Init` and existing
-   `BenchmarkBlockIterSeekGE/SeekLT/Next/Prev`, deciding between a one-time
-   scan and hot-path guards from measured cost. Row blocks remain in use
-   for older table formats, not just historical test data.
+4. **Row-block framing (staged).** First bound the independent `RawIter`
+   metadata/properties path: trailer, restarts, entry varints and key/value
+   spans, including empty `First`/`Last`/`SeekGE`, reverse iteration and
+   direct reader error conversion. It need not change data-block iterators or
+   cache metadata. Then cover `Iter`'s entry and restart-seek paths, including
+   `nextPrefixV3`, before claiming row data/index/keyspan protection. A
+   one-pass block-load proof could preserve hot loops, but requires evidence
+   for direct initialization, legacy full-key sharing, v3 value-prefix
+   *data* blocks, and the provenance of any cached validation marker across
+   block kinds and pooled buffers. Do not trust an untyped marker merely
+   because a cache hit returned it. Keep external value-handle decoding a
+   separate nested proof; a bounded row value does not bound its handle.
+   Test writer blocks with multiple restarts and empty blocks, corrupted
+   offsets and 1–5-byte varints; compare cold block load and warm
+   `SeekGE`/`SeekLT`/`Next`/`Prev` before choosing a one-time scan over
+   checked consumers. Safe panics may remain where no read escapes the block.
+   Row blocks still serve older table formats.
 5. **Prefix bundle arithmetic (after PRs 2–3).**
    `DecodePrefixBytes` reads an untrusted bundle shift; `bundleCalc` derives
    counts and indexes consumed by `PrefixBytes.SetAt`, `SetNext`,
