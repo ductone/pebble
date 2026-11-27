@@ -1284,6 +1284,30 @@ func (i *DataBlockIter) InitOnce(
 	i.tieringConfig = tieringConfig
 }
 
+// maxMaterializedKeyLength is the largest key length for which a
+// PrefixBytesIter buffer can be sized: PrefixBytesIter.Init allocates one byte
+// beyond the maximum key length, and that sum must remain a non-negative int.
+const maxMaterializedKeyLength = math.MaxInt - 1
+
+// materializedKeyCapacity returns the longest user key a DataBlockIter may
+// materialize: the synthetic prefix, the block's recorded maximum key length
+// (the worst case is the longest key having no suffix) and the synthetic
+// suffix. The uint32 operands are summed in uint64 so they cannot wrap, and a
+// sum above limit is reported as corruption rather than clamped or narrowed.
+// Callers pass maxMaterializedKeyLength; limit is a parameter only so that
+// tests can exercise the 32-bit limit on any platform.
+func materializedKeyCapacity(
+	ps blockiter.SyntheticPrefixAndSuffix, maximumKeyLength uint32, limit uint64,
+) (int, error) {
+	n := uint64(ps.PrefixLen()) + uint64(maximumKeyLength) + uint64(ps.SuffixLen())
+	if n > limit {
+		return 0, base.CorruptionErrorf(
+			"data block maximum key length %d with synthetic prefix length %d and suffix length %d exceeds the addressable key length %d",
+			errors.Safe(maximumKeyLength), errors.Safe(ps.PrefixLen()), errors.Safe(ps.SuffixLen()), errors.Safe(limit))
+	}
+	return int(n), nil
+}
+
 // Init initializes the data block iterator, configuring it to read from the
 // provided decoder. The tieringConfig parameter indicates whether the block
 // contains tiering columns that should be decoded lazily.
@@ -1309,8 +1333,12 @@ func (i *DataBlockIter) Init(
 	i.keySchema.InitKeySeekerMetadata(meta, d, bd)
 	i.keySeeker = i.keySchema.KeySeeker(meta)
 
-	// The worst case is when the largest key in the block has no suffix.
-	maxKeyLength := int(i.transforms.SyntheticPrefixAndSuffix.PrefixLen() + d.maximumKeyLength + i.transforms.SyntheticPrefixAndSuffix.SuffixLen())
+	maxKeyLength, err := materializedKeyCapacity(
+		i.transforms.SyntheticPrefixAndSuffix, d.maximumKeyLength, maxMaterializedKeyLength)
+	if err != nil {
+		i.Invalidate()
+		return err
+	}
 	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix())
 	i.row = -1
 	i.kv = base.InternalKV{}
@@ -1350,8 +1378,15 @@ func (i *DataBlockIter) InitHandle(
 	}
 	i.noTransforms = i.transforms.NoTransforms()
 
-	// The worst case is when the largest key in the block has no suffix.
-	maxKeyLength := int(i.transforms.SyntheticPrefixAndSuffix.PrefixLen() + i.d.maximumKeyLength + i.transforms.SyntheticPrefixAndSuffix.SuffixLen())
+	// Assign the key seeker before any error return so that a failed
+	// InitHandle never leaves a seeker for the previous, released block.
+	i.keySeeker = i.keySchema.KeySeeker(keySeekerMeta)
+	maxKeyLength, err := materializedKeyCapacity(
+		i.transforms.SyntheticPrefixAndSuffix, i.d.maximumKeyLength, maxMaterializedKeyLength)
+	if err != nil {
+		i.Invalidate()
+		return err
+	}
 	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix())
 	i.row = -1
 	i.kv = base.InternalKV{}
@@ -1359,7 +1394,6 @@ func (i *DataBlockIter) InitHandle(
 	i.nextObsoletePoint = 0
 	i.prefixCacheStart = -1
 	i.nextPrefixChange = -1
-	i.keySeeker = i.keySchema.KeySeeker(keySeekerMeta)
 
 	// Reset tiering state for lazy initialization. Block data will be obtained
 	// from h.BlockData() when needed.
