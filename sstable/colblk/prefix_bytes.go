@@ -206,15 +206,22 @@ var _ Array[[]byte] = PrefixBytes{}
 func DecodePrefixBytes(
 	b []byte, offset uint32, count int,
 ) (prefixBytes PrefixBytes, endOffset uint32) {
-	if count == 0 {
-		panic(errors.AssertionFailedf("empty PrefixBytes"))
+	if count <= 0 || uint64(offset)+1 >= uint64(len(b)) || offset == ^uint32(0) {
+		panic(errors.AssertionFailedf("invalid PrefixBytes offset %d or count %d for %d-byte buffer",
+			offset, count, len(b)))
 	}
 	// The first byte of a PrefixBytes-encoded column is the bundle size
 	// expressed as log2 of the bundle size (the bundle size must always be a
 	// power of two)
 	bundleShift := uint32(*((*uint8)(unsafe.Pointer(&b[offset]))))
+	if bundleShift >= 32 {
+		panic(errors.AssertionFailedf("invalid PrefixBytes bundle shift %d", bundleShift))
+	}
 	calc := makeBundleCalc(bundleShift)
 	nBundles := int(calc.bundleCount(count))
+	if uint64(count)+uint64(nBundles) > uint64(^uint32(0))-1 {
+		panic(errors.AssertionFailedf("PrefixBytes slice count overflow: %d + %d", count, nBundles))
+	}
 
 	rb, endOffset := DecodeRawBytes(b, offset+1, count+nBundles)
 	pb := PrefixBytes{

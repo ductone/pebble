@@ -30,29 +30,40 @@ var _ Array[uint64] = UnsafeUints{}
 // DecodeUnsafeUints decodes the structure of a slice of uints from a
 // byte slice.
 func DecodeUnsafeUints(b []byte, off uint32, rows int) (_ UnsafeUints, endOffset uint32) {
+	if rows < 0 || uint64(off) >= uint64(len(b)) {
+		panic(errors.AssertionFailedf("uint column has invalid start %d or row count %d for %d-byte buffer",
+			off, rows, len(b)))
+	}
 	if rows == 0 {
-		// NB: &b[off] is actually pointing beyond the uints serialization.  We
-		// ensure this is always valid at the block-level by appending a
-		// trailing 0x00 block padding byte to all serialized columnar blocks.
-		// This means &b[off] will always point to a valid, allocated byte even
-		// if this is the last column of the block.
+		// The final padding byte makes even an empty column's pointer valid.
 		return makeUnsafeUints(0, unsafe.Pointer(&b[off]), 0), off
 	}
 	encoding := UintEncoding(b[off])
 	if !encoding.IsValid() {
 		panic(errors.AssertionFailedf("invalid encoding 0x%x", b[off:off+1]))
 	}
-	off++
+	pos := uint64(off) + 1
 	var base uint64
 	if encoding.IsDelta() {
-		base = binary.LittleEndian.Uint64(b[off:])
-		off += 8
+		base = binary.LittleEndian.Uint64(b[pos:])
+		pos += 8
 	}
 	w := encoding.Width()
 	if w > 0 {
-		off = align(off, uint32(w))
+		pos = align(pos, uint64(w))
 	}
-	return makeUnsafeUints(base, unsafe.Pointer(&b[off]), w), off + uint32(rows*w)
+	// Accessors use unchecked pointer arithmetic. Prove the entire column
+	// resides within this page before constructing an accessor.
+	if pos >= uint64(len(b)) || pos > uint64(^uint32(0)) ||
+		(w > 0 && uint64(rows) > (uint64(len(b))-pos)/uint64(w)) {
+		panic(errors.AssertionFailedf("uint column exceeds its buffer: offset %d, rows %d, width %d, buffer %d",
+			pos, rows, w, len(b)))
+	}
+	end := pos + uint64(rows)*uint64(w)
+	if end > uint64(^uint32(0)) {
+		panic(errors.AssertionFailedf("uint column end exceeds encoded offset limit: %d", end))
+	}
+	return makeUnsafeUints(base, unsafe.Pointer(&b[pos]), w), uint32(end)
 }
 
 // Assert that DecodeUnsafeIntegerSlice implements DecodeFunc.

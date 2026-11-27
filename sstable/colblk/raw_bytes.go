@@ -10,6 +10,7 @@ import (
 	"io"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2/internal/binfmt"
 	"github.com/cockroachdb/pebble/v2/internal/invariants"
 	"github.com/cockroachdb/pebble/v2/internal/treeprinter"
@@ -60,16 +61,40 @@ var _ Array[[]byte] = RawBytes{}
 // for an array of byte slices constructed by RawBytesBuilder. Count must be the
 // number of byte slices within the array.
 func DecodeRawBytes(b []byte, offset uint32, count int) (rawBytes RawBytes, endOffset uint32) {
+	if count < 0 {
+		panic(errors.AssertionFailedf("negative RawBytes slice count: %d", count))
+	}
 	if count == 0 {
 		return RawBytes{}, offset
 	}
 	offsets, dataOff := DecodeUnsafeOffsets(b, offset, count+1 /* +1 offset */)
+	if uint64(dataOff) >= uint64(len(b)) {
+		panic(errors.AssertionFailedf("RawBytes data starts beyond slice: offset %d, length %d", dataOff, len(b)))
+	}
+	last := offsets.At(count)
+	if uint64(last) > uint64(len(b))-uint64(dataOff) || uint64(dataOff)+uint64(last) > uint64(^uint32(0)) {
+		panic(errors.AssertionFailedf("RawBytes data extends beyond slice: offset %d, last %d, length %d",
+			dataOff, last, len(b)))
+	}
+	// Intermediate offsets feed unchecked pointer arithmetic in At2 and in
+	// prefix-byte iterators. The final offset alone cannot bound them.
+	if offsets.width != 0 {
+		prev := offsets.At(0)
+		for i := 1; i <= count; i++ {
+			next := offsets.At(i)
+			if next < prev || next > last {
+				panic(errors.AssertionFailedf("RawBytes offsets are not monotonic at index %d: %d, %d, final %d",
+					i, prev, next, last))
+			}
+			prev = next
+		}
+	}
 	return RawBytes{
 		slices:  count,
 		offsets: offsets,
 		start:   unsafe.Pointer(&b[offset]),
 		data:    unsafe.Pointer(&b[dataOff]),
-	}, dataOff + offsets.At(count)
+	}, dataOff + last
 }
 
 // Assert that DecodeRawBytes implements DecodeFunc.

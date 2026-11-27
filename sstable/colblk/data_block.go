@@ -914,6 +914,12 @@ func (d *DataBlockDecoder) Init(schema *KeySchema, data []byte) {
 	d.isValueExternal = d.d.Bitmap(len(schema.ColumnTypes) + dataBlockColumnIsValueExternal)
 	d.isObsolete = d.d.Bitmap(len(schema.ColumnTypes) + dataBlockColumnIsObsolete)
 	d.maximumKeyLength = binary.LittleEndian.Uint32(data[schema.HeaderSize:])
+	// A key is materialized solely from bytes in this block. Reject an
+	// impossible size before an iterator allocates a buffer from this header.
+	if uint64(d.maximumKeyLength) > uint64(len(data)) {
+		panic(errors.AssertionFailedf("maximum key length %d exceeds data block length %d",
+			d.maximumKeyLength, len(data)))
+	}
 }
 
 // Describe descirbes the binary format of the data block, assuming f.Offset()

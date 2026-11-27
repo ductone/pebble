@@ -36,26 +36,47 @@ type Bitmap struct {
 // Assert that Bitmap implements Array[bool].
 var _ Array[bool] = Bitmap{}
 
-// DecodeBitmap decodes the structure of a Bitmap and returns a Bitmap that
-// reads from b supporting bitCount logical bits. No bounds checking is
-// performed, so the caller must guarantee the bitmap is appropriately sized and
-// the provided bitCount correctly identifies the number of bits in the bitmap.
+// DecodeBitmap decodes the structure of a Bitmap. Seek operations use its
+// summary as an unchecked index, so the summary must agree with its data.
 func DecodeBitmap(b []byte, off uint32, bitCount int) (bitmap Bitmap, endOffset uint32) {
+	if bitCount < 0 || uint64(off) >= uint64(len(b)) || off == ^uint32(0) {
+		panic(errors.AssertionFailedf("invalid bitmap offset %d or bit count %d", off, bitCount))
+	}
 	encoding := bitmapEncoding(b[off])
 	off++
 	if encoding == zeroBitmapEncoding {
 		return Bitmap{bitCount: bitCount}, off
 	}
-	off = align(off, align64)
-	sz := bitmapRequiredSize(bitCount)
-	if len(b) < int(off)+sz {
-		panic(errors.AssertionFailedf("bitmap of %d bits requires at least %d bytes; provided with %d-byte slice",
-			bitCount, bitmapRequiredSize(bitCount), len(b[off:])))
+	if encoding != defaultBitmapEncoding || uint64(bitCount) > uint64(len(b))*8 {
+		panic(errors.AssertionFailedf("invalid bitmap encoding %d or bit count %d", encoding, bitCount))
 	}
-	return Bitmap{
-		data:     makeUnsafeUint64Decoder(b[off:], sz>>align64Shift),
+	pos := align(uint64(off), uint64(align64))
+	sz := bitmapRequiredSize(bitCount)
+	end := pos + uint64(sz)
+	if end > uint64(len(b)) || end > uint64(^uint32(0)) {
+		panic(errors.AssertionFailedf("bitmap of %d bits requires %d bytes; provided with %d-byte slice",
+			bitCount, sz, len(b)))
+	}
+	bitmap = Bitmap{
+		data:     makeUnsafeUint64Decoder(b[pos:], sz>>align64Shift),
 		bitCount: bitCount,
-	}, off + uint32(sz)
+	}
+	nWords := (bitCount + 63) >> 6
+	if rem := bitCount & 63; rem != 0 && bitmap.data.At(nWords-1)>>rem != 0 {
+		panic(errors.AssertionFailedf("bitmap has bits beyond its row count"))
+	}
+	for summary := range (nWords + 63) >> 6 {
+		var expected uint64
+		for j := range min(64, nWords-summary*64) {
+			if bitmap.data.At(summary*64+j) != 0 {
+				expected |= 1 << j
+			}
+		}
+		if bitmap.data.At(nWords+summary) != expected {
+			panic(errors.AssertionFailedf("bitmap summary %d does not match its data words", summary))
+		}
+	}
+	return bitmap, uint32(end)
 }
 
 // Assert that DecodeBitmap implements DecodeFunc.
