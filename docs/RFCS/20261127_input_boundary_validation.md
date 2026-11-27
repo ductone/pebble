@@ -95,6 +95,8 @@ rules apply to a *validated view*, not to an arbitrary `[]byte`:
   byte*; an adjacent-page or trailing byte borrowed solely as a sentinel
   must never be dereferenced as page content. Avoid forming an unsafe pointer
   before its address is proved to lie within the underlying allocation.
+  A direct exact-sized buffer can end in an empty value: form that empty view
+  from an address within the allocation, not a one-past pointer.
 - **Logical extent.** Check row/count conversions, including independent
   counts in custom headers, and `count+1` before use. Positive-width
   `count <= available/width` bounds the physical column; a dependent-offset
@@ -102,6 +104,9 @@ rules apply to a *validated view*, not to an arbitrary `[]byte`:
   bytes: check the constant (including a delta base) once, never loop over
   an unencoded logical count. `At(row)` still requires `0 <= row < count`;
   adjacent reads need both indexes valid without overflowing the addition.
+  A width-zero column may still claim a count that does not fit the accessor's
+  `int` row representation; reject it before narrowing or decoding a dependent
+  column, without scanning the unencoded rows.
 - **Cross-column extent.** Validate offset monotonicity, summary-bit targets,
   bundle/prefix relationships and keyspan boundary indices against the
   columns they will index before exposing their unchecked accessors. A final
@@ -156,8 +161,11 @@ or consumer, validation timing, lifetime, failure path, and cold/warm cost.
 For each new rejection, show why the writer (including a partial `Finish`) and
 supported older formats cannot emit it. Prove any bound derived from encoded
 bytes in production; retain invariants-only checks for programmer misuse.
-This is a review rule, not a runtime descriptor, global recovery mechanism
-or new public API.
+This is a review rule, not a runtime descriptor or global recovery mechanism.
+Preserve exported constructor signatures when existing callers may use them
+as method values. If a reader needs an error where `Init` historically
+panicked, a small checked entry point can return contextual corruption while
+the original `Init` safely panics on malformed bytes.
 
 ## Proposed factoring, without per-row overhead
 
@@ -208,6 +216,13 @@ Keep new validation work on valid inputs distinct from resource limits:
 measure it against representative reads and disclose outliers. A pathological
 slowdown may warrant a separate optimization without weakening the bounds
 proof or adding an arbitrary size cap.
+
+The fork's [RawBytes offsets PR #9](https://github.com/ductone/pebble/pull/9)
+measured metadata initialization at 123 ns before versus 4.84 µs after
+for a 3,400-row block; warm iteration was within noise. That cold cost is
+material, not a reason to leave unchecked offsets: compare an integrated
+read/checksum/decompress/init miss and the specialized scan against a plain
+loop before claiming the trade-off upstream.
 
 # Proposed upstream PR stack
 
@@ -271,9 +286,9 @@ remain the columnar foundation.
    each byte before use. Test truncation at each varint position with a
    restricted-capacity canary, both eager handle creation and lazy
    `ValueFetcher.FetchHandle` / `valblk` fetch, and existing writer round
-   trips. Decide whether the caller returns an error or a checked panic;
-   if an exported signature changes, update all callers. Benchmark valid
-   handle-heavy iteration, not just an isolated cold decoder.
+   trips. Preserve exported signatures by default; use a checked entry point
+   where a caller must return corruption instead of a safe panic. Benchmark
+   valid handle-heavy iteration, not just an isolated cold decoder.
 4. **Row-block framing (staged).** First bound the independent `RawIter`
    metadata/properties path: trailer, restarts, entry varints and key/value
    spans, including empty `First`/`Last`/`SeekGE`, reverse iteration and
