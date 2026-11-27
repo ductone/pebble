@@ -1624,10 +1624,12 @@ func (i *DataBlockIter) initTieringMetadata() bool {
 		return false
 	}
 
-	// Decode the tiering columns.
+	// Decode the tiering columns. A non-nil tieringSpanIDs.ptr marks both
+	// columns as decoded, so assign neither until both decode successfully.
 	bd := DecodeBlock(data, DataBlockCustomHeaderSize+i.keySchema.HeaderSize)
-	i.tieringSpanIDs = bd.Uints(len(i.keySchema.ColumnTypes) + dataBlockColumnTieringSpanID)
-	i.tieringAttributes = bd.Uints(len(i.keySchema.ColumnTypes) + dataBlockColumnTieringAttribute)
+	spanIDs := bd.Uints(len(i.keySchema.ColumnTypes) + dataBlockColumnTieringSpanID)
+	attributes := bd.Uints(len(i.keySchema.ColumnTypes) + dataBlockColumnTieringAttribute)
+	i.tieringSpanIDs, i.tieringAttributes = spanIDs, attributes
 	return true
 }
 

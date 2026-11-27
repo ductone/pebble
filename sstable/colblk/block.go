@@ -287,15 +287,21 @@ func FinishBlock(rows int, writers []ColumnWriter) []byte {
 func DecodeColumn[V any](
 	d *BlockDecoder, col int, rows uint32, dataType DataType, decodeFunc DecodeFunc[V],
 ) V {
-	if uint16(col) >= d.header.Columns {
+	if col < 0 || col >= int(d.header.Columns) {
 		panic(errors.AssertionFailedf("column %d is out of range [0, %d)", errors.Safe(col), errors.Safe(d.header.Columns)))
 	}
 	if dt := d.dataType(col); dt != dataType {
 		panic(errors.AssertionFailedf("column %d is type %s; not %s", errors.Safe(col), dt, dataType))
 	}
-	v, endOffset := decodeFunc(d.data, d.pageStart(col), rows)
-	if nextColumnOff := d.pageStart(col + 1); endOffset != nextColumnOff {
-		panic(errors.AssertionFailedf("column %d decoded to offset %d; expected %d", errors.Safe(col), errors.Safe(endOffset), errors.Safe(nextColumnOff)))
+	// Init verified that the column's page lies within the block and is
+	// followed by at least one byte. Limit decodeFunc to the page and that
+	// byte, which allows an empty column to construct a valid pointer. A
+	// malformed column may read the byte, but the decoded column must end
+	// exactly at the end of its page.
+	end := d.pageStart(col + 1)
+	v, endOffset := decodeFunc(d.data[:end+1:end+1], d.pageStart(col), rows)
+	if endOffset != end {
+		panic(errors.AssertionFailedf("column %d decoded to offset %d; expected %d", errors.Safe(col), errors.Safe(endOffset), errors.Safe(end)))
 	}
 	return v
 }
@@ -317,10 +323,33 @@ func DecodeBlock(data []byte, customHeaderSize uint32) BlockDecoder {
 }
 
 // Init initializes a BlockDecoder with the data contained in the provided block.
+// Init validates the block header and the start of every column's page, which
+// column decoders rely on before constructing unchecked views of the block.
 func (d *BlockDecoder) Init(data []byte, customHeaderSize uint32) {
+	if uint64(len(data)) < uint64(customHeaderSize)+blockHeaderBaseSize {
+		panic(errors.AssertionFailedf("columnar block of %d bytes is too small for its header",
+			errors.Safe(len(data))))
+	}
+	h := DecodeHeader(data[customHeaderSize:])
+	// The column headers are followed by the column pages and a trailing
+	// padding byte.
+	colHeaders := uint64(customHeaderSize) + blockHeaderBaseSize
+	pageStart := colHeaders + uint64(h.Columns)*columnHeaderSize
+	if h.Version != Version1 || pageStart >= uint64(len(data)) {
+		panic(errors.AssertionFailedf("invalid columnar block header (%s) for %d-byte block",
+			errors.Safe(h), errors.Safe(len(data))))
+	}
+	for col := range uint64(h.Columns) {
+		off := uint64(binary.LittleEndian.Uint32(data[colHeaders+col*columnHeaderSize+1:]))
+		if off < pageStart || off >= uint64(len(data)) {
+			panic(errors.AssertionFailedf("column %d page starts at offset %d; expected [%d, %d)",
+				errors.Safe(col), errors.Safe(off), errors.Safe(pageStart), errors.Safe(len(data))))
+		}
+		pageStart = off
+	}
 	*d = BlockDecoder{
 		data:             data,
-		header:           DecodeHeader(data[customHeaderSize:]),
+		header:           h,
 		customHeaderSize: customHeaderSize,
 	}
 }
@@ -333,7 +362,7 @@ func (d *BlockDecoder) Rows() int {
 // DataType returns the data type of the col'th column. Every column's data type
 // is encoded within the block header.
 func (d *BlockDecoder) DataType(col int) DataType {
-	if uint16(col) >= d.header.Columns {
+	if col < 0 || col >= int(d.header.Columns) {
 		panic(errors.AssertionFailedf("column %d is out of range [0, %d)", errors.Safe(col), errors.Safe(d.header.Columns)))
 	}
 	return d.dataType(col)
