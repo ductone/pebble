@@ -472,7 +472,15 @@ func (rw *blobFileRewriter) generateHeap(ctx context.Context) error {
 				return err
 			}
 			defer h.Release()
-			decoder.Init(h.BlockData())
+			if err := decoder.InitChecked(h.BlockData()); err != nil {
+				return errors.Wrapf(err, "table %s blob reference index", sst.TableNum)
+			}
+			// The reference ID comes from the table's metadata; check it
+			// against the block before reading the row.
+			if rows := decoder.BlockDecoder().Rows(); uint64(refID) >= uint64(rows) {
+				return base.CorruptionErrorf("table %s references blob file %s with reference ID %d, "+
+					"but its blob reference liveness block has %d rows", sst.TableNum, rw.inputBlob.FileID, refID, rows)
+			}
 			bitmapEncodings := slices.Clone(decoder.LivenessAtReference(int(refID)))
 			// TODO(annie): We should instead maintain 1 heap item per sstable
 			// instead of 1 heap item per sstable block ref to reduce the heap

@@ -872,7 +872,9 @@ func validateBlobValueLiveness(
 				return err
 			}
 			defer h.Release()
-			decoder.Init(h.BlockData())
+			if err := decoder.InitChecked(h.BlockData()); err != nil {
+				return errors.Wrapf(err, "table %s blob reference index", t.TableNum)
+			}
 			return performValidationForSSTable(decoder, t.TableNum, referenced)
 		}); err != nil {
 			return err

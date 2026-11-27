@@ -5,6 +5,7 @@
 package colblk
 
 import (
+	"math"
 	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/base"
@@ -84,10 +85,55 @@ type ReferenceLivenessBlockDecoder struct {
 }
 
 // Init initializes the decoder with the given serialized reference liveness
-// block.
+// block. It panics with the corruption error returned by InitChecked if the
+// block is malformed; callers decoding blocks read from disk should use
+// InitChecked.
 func (d *ReferenceLivenessBlockDecoder) Init(data []byte) {
+	if err := d.InitChecked(data); err != nil {
+		panic(err)
+	}
+}
+
+// InitChecked initializes the decoder with the given serialized reference
+// liveness block. It returns a corruption error, and leaves the decoder empty,
+// if the block is too small for its header, has an unexpected version, column
+// count or row count, or fails DecodeRawBytes' checks of the column.
+//
+// BlockDecoder reads the block header and the column's header through unchecked
+// pointers, so InitChecked bounds those bytes itself before decoding. The column
+// is then decoded by DecodeRawBytes, which reads the encoding, the offsets table
+// and the data section only through bounds-checked slices. It asserts that the
+// table and data lie within the block and that the offsets are nondecreasing,
+// so every row LivenessAtReference returns lies within data. InitChecked
+// converts those assertion panics, and DecodeColumn's end-offset assertion,
+// into corruption errors.
+func (d *ReferenceLivenessBlockDecoder) InitChecked(data []byte) (err error) {
+	*d = ReferenceLivenessBlockDecoder{}
+	// Convert assertion panics from the column decoders to corruption errors
+	// so that callers reading untrusted tables (e.g. during ingestion) can
+	// report them.
+	defer func() {
+		if r := recover(); r != nil {
+			*d = ReferenceLivenessBlockDecoder{}
+			err = base.CorruptionErrorf("pebble: error initializing reference liveness block: %v", r)
+		}
+	}()
+	// The block must hold the header, the single column's header and the
+	// trailing padding byte before any of them are read.
+	minSize := uint64(HeaderSize(valueLivenessBlockColumnCount, valueLivenessBlockCustomHeaderSize)) + 1
+	if uint64(len(data)) < minSize {
+		return base.CorruptionErrorf("pebble: reference liveness block is %d bytes; expected at least %d",
+			len(data), minSize)
+	}
 	d.bd.Init(data, valueLivenessBlockCustomHeaderSize)
+	if h := d.bd.header; h.Version != Version1 || h.Columns != valueLivenessBlockColumnCount ||
+		uint64(h.Rows) > math.MaxInt {
+		*d = ReferenceLivenessBlockDecoder{}
+		return base.CorruptionErrorf("pebble: reference liveness block has version %d, %d columns and %d rows; "+
+			"expected version %d and %d column", h.Version, h.Columns, h.Rows, Version1, valueLivenessBlockColumnCount)
+	}
 	d.values = d.bd.RawBytes(valueLivenessBlockColumnIndex)
+	return nil
 }
 
 // DebugString prints a human-readable explanation of the reference liveness
@@ -124,6 +170,8 @@ func (d *ReferenceLivenessBlockDecoder) BlockDecoder() *BlockDecoder {
 }
 
 // LivenessAtReference returns the liveness of the reference (the given index).
+// The index must be in [0, BlockDecoder().Rows()); callers that take the index
+// from table metadata must check it first.
 func (d *ReferenceLivenessBlockDecoder) LivenessAtReference(i int) []byte {
 	return d.values.At(i)
 }

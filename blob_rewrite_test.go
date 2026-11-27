@@ -7,7 +7,10 @@ package pebble
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -459,4 +462,209 @@ func (m constantFileMapping) Lookup(fileID base.BlobFileID) (base.ObjectInfo, bo
 		DiskFileNum: base.DiskFileNum(m),
 		Bounds:      base.UserKeyBounds{},
 	}, true
+}
+
+// TestBlobRewriteMalformedLivenessReference checks that a blob rewrite returns
+// a corruption error naming the table, instead of panicking or reading past the
+// block, when a table's blob reference liveness block cannot serve the
+// reference ID its metadata assigns to the input blob file.
+func TestBlobRewriteMalformedLivenessReference(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const blobFileNum = base.DiskFileNum(10)
+	const tableFileNum = base.DiskFileNum(11)
+	ctx := context.Background()
+
+	// setup writes a blob file holding one value and a table whose single key
+	// references it as reference ID 0, so the table's liveness block has one
+	// row. mutate may rewrite the liveness block in place.
+	setup := func(t *testing.T, mutate func(livenessBlock []byte)) objstorage.Provider {
+		fs := vfs.NewMem()
+		var st objstorageprovider.Settings
+		st.Local.FS = fs
+		objStore, err := objstorageprovider.Open(st)
+		require.NoError(t, err)
+
+		value := []byte("blob-value")
+		w, _, err := objStore.Create(ctx, base.FileTypeBlob, blobFileNum, objstorage.CreateOptions{})
+		require.NoError(t, err)
+		blobWriter := blob.NewFileWriter(blobFileNum, w, blob.FileWriterOptions{})
+		handle := blobWriter.AddValue(value, false /* isLikelyMVCCGarbage */)
+		_, err = blobWriter.Close()
+		require.NoError(t, err)
+
+		w, _, err = objStore.Create(ctx, base.FileTypeTable, tableFileNum, objstorage.CreateOptions{})
+		require.NoError(t, err)
+		tw := sstable.NewRawWriter(w, sstable.WriterOptions{
+			TableFormat: sstable.TableFormatMax,
+			Checksum:    block.ChecksumTypeCRC32c,
+		})
+		require.NoError(t, tw.AddWithBlobHandle(
+			base.MakeInternalKey([]byte("a"), 1, base.InternalKeyKindSet),
+			blob.InlineHandle{
+				InlineHandlePreface: blob.InlineHandlePreface{ReferenceID: 0, ValueLen: uint32(len(value))},
+				HandleSuffix:        blob.HandleSuffix{BlockID: handle.BlockID, ValueID: handle.ValueID},
+			},
+			base.ShortAttribute(0),
+			false, /* forceObsolete */
+			base.KVMeta{},
+		))
+		require.NoError(t, tw.Close())
+
+		if mutate != nil {
+			mutateBlobRefIndexBlock(t, fs, objStore, tableFileNum, mutate)
+		}
+		return objStore
+	}
+
+	// rewrite runs the heap-generation phase of a blob rewrite, in which the
+	// table's metadata lists the input blob file at position refID.
+	rewrite := func(t *testing.T, objStore objstorage.Provider, refID int) error {
+		fc := NewFileCache(1, 100)
+		defer fc.Unref()
+		c := cache.New(100)
+		defer c.Unref()
+		ch := c.NewHandle()
+		defer ch.Close()
+		fch := fc.newHandle(ch, objStore, base.NoopLoggerAndTracer{}, sstable.ReaderOptions{}, nil)
+		defer fch.Close()
+
+		refs := make([]manifest.BlobReference, refID+1)
+		for i := range refs {
+			refs[i].FileID = base.BlobFileID(blobFileNum + 100 + base.DiskFileNum(i))
+		}
+		refs[refID].FileID = base.BlobFileID(blobFileNum)
+		table := &manifest.TableMetadata{
+			TableNum:       base.TableNum(tableFileNum),
+			TableBacking:   &manifest.TableBacking{DiskFileNum: tableFileNum},
+			BlobReferences: refs,
+		}
+		inputBlob := manifest.BlobFileMetadata{
+			FileID:   base.BlobFileID(blobFileNum),
+			Physical: &manifest.PhysicalBlobFile{FileNum: blobFileNum, CreationTime: uint64(time.Now().Unix())},
+		}
+		// Only the heap-generation phase reads the liveness block, so the
+		// rewriter is built without an output blob file writer.
+		rewriter := &blobFileRewriter{
+			fc:        fch,
+			readEnv:   block.ReadEnv{},
+			sstables:  []*manifest.TableMetadata{table},
+			inputBlob: inputBlob,
+			blkHeap:   blockHeap{},
+		}
+		return rewriter.generateHeap(ctx)
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		objStore := setup(t, nil)
+		defer objStore.Close()
+		require.NoError(t, rewrite(t, objStore, 0))
+	})
+
+	t.Run("reference-id-beyond-block", func(t *testing.T) {
+		objStore := setup(t, nil)
+		defer objStore.Close()
+		err := rewrite(t, objStore, 1)
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "reference ID 1")
+		require.Contains(t, err.Error(), "has 1 rows")
+	})
+
+	t.Run("malformed-block", func(t *testing.T) {
+		objStore := setup(t, func(blk []byte) { blk[0]++ /* columnar block version */ })
+		defer objStore.Close()
+		err := rewrite(t, objStore, 0)
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "table 000011 blob reference index")
+		// Depending on the colblk checks below this package, either the block
+		// decoder or InitChecked rejects the version.
+		require.Regexp(t, `reference liveness block.*(?i:version)[ =]2`, err.Error())
+	})
+
+	t.Run("rows-max-int32", func(t *testing.T) {
+		objStore := setup(t, func(blk []byte) { setLivenessBlockRows(blk, math.MaxInt32) })
+		defer objStore.Close()
+		err := rewrite(t, objStore, 0)
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "table 000011 blob reference index")
+		require.Regexp(t, `reference liveness block: .*extends? beyond`, err.Error())
+	})
+
+	t.Run("decreasing-offset", func(t *testing.T) {
+		// The table has a single row, so make its start offset exceed its end.
+		objStore := setup(t, func(blk []byte) { decreaseLivenessBlockOffset(t, blk, 0) })
+		defer objStore.Close()
+		err := rewrite(t, objStore, 0)
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "table 000011 blob reference index")
+		require.Contains(t, err.Error(), "is less than the preceding offset")
+	})
+}
+
+// mutateBlobRefIndexBlock rewrites, in place on fs, the blob reference
+// liveness block of the table with the given file number, which must have been
+// written with CRC32c checksums. The block trailer's checksum is recomputed so
+// that the mutation is not detected as a checksum mismatch.
+func mutateBlobRefIndexBlock(
+	t *testing.T,
+	fs vfs.FS,
+	objStore objstorage.Provider,
+	tableFileNum base.DiskFileNum,
+	mutate func(livenessBlock []byte),
+) {
+	ctx := context.Background()
+	readable, err := objStore.OpenForReading(ctx, base.FileTypeTable, tableFileNum, objstorage.OpenOptions{})
+	require.NoError(t, err)
+	r, err := sstable.NewReader(ctx, readable, sstable.ReaderOptions{})
+	require.NoError(t, err)
+	layout, err := r.Layout()
+	require.NoError(t, err)
+	bh := layout.BlobReferenceIndex
+	require.NoError(t, r.Close())
+	require.NotZero(t, bh.Length)
+
+	path := base.MakeFilepath(fs, "", base.FileTypeTable, tableFileNum)
+	src, err := fs.Open(path)
+	require.NoError(t, err)
+	data, err := io.ReadAll(src)
+	require.NoError(t, err)
+	require.NoError(t, src.Close())
+	blk := data[bh.Offset : bh.Offset+bh.Length]
+	mutate(blk)
+	var c block.Checksummer
+	c.Init(block.ChecksumTypeCRC32c)
+	blockType := data[bh.Offset+bh.Length]
+	trailer := block.MakeTrailer(blockType, c.Checksum(blk, blockType))
+	copy(data[bh.Offset+bh.Length:], trailer[:])
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
+	require.NoError(t, err)
+	_, err = f.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}
+
+// The helpers below edit a reference liveness block in place, relying on the
+// columnar block layout: a version byte, a 2-byte column count and a 4-byte row
+// count, followed by the single column's type byte and 4-byte page start. The
+// column is a RawBytes whose page begins with its offsets encoding byte.
+
+// setLivenessBlockRows overwrites the block header's row count.
+func setLivenessBlockRows(blk []byte, rows uint32) {
+	binary.LittleEndian.PutUint32(blk[3:], rows)
+}
+
+// decreaseLivenessBlockOffset makes offset i of the block's offsets table
+// exceed offset i+1. The offsets must be encoded with a 1-byte width, as they
+// are for small blocks.
+func decreaseLivenessBlockOffset(t *testing.T, blk []byte, i int) {
+	page := binary.LittleEndian.Uint32(blk[8:])
+	require.Equal(t, byte(1), blk[page], "expected 1-byte offsets")
+	rows := int(binary.LittleEndian.Uint32(blk[3:]))
+	require.Less(t, i, rows)
+	offsets := blk[page+1 : int(page)+2+rows]
+	require.Less(t, offsets[i+1], byte(0xff))
+	offsets[i] = offsets[i+1] + 1
 }
