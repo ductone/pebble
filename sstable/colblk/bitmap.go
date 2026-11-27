@@ -287,7 +287,12 @@ func (b Bitmap) summaryTableBounds() (startOffset, endOffset int) {
 func (b Bitmap) String() string {
 	var sb strings.Builder
 	for w := range bitmapWords(b.bitCount) {
-		fmt.Fprintf(&sb, "%064b", b.data.At(w))
+		var word uint64
+		if b.data.ptr != nil {
+			// The zero bitmap encoding has no words.
+			word = b.data.At(w)
+		}
+		fmt.Fprintf(&sb, "%064b", word)
 	}
 	return sb.String()
 }
@@ -400,7 +405,7 @@ func (b *BitmapBuilder) Invert(nRows int) {
 	// finished encoding any rows at all, it uses the default encoding.
 	b.minNonZeroRowCount = 1
 	// If the tail of b is sparse, fill in zeroes before inverting.
-	nBitmapWords := (nRows + 63) >> 6
+	nBitmapWords := bitmapWords(nRows)
 	for len(b.words) < nBitmapWords {
 		// We append zeros because if b.words has additional capacity, it has
 		// not been zeroed.
@@ -423,7 +428,7 @@ func (b *BitmapBuilder) Finish(col, nRows int, offset uint32, buf []byte) uint32
 	offset++
 	offset = alignWithZeroes(buf, offset, align64)
 
-	nBitmapWords := (nRows + 63) >> 6
+	nBitmapWords := bitmapWords(nRows)
 	// Truncate the bitmap to the number of words required to represent nRows.
 	// The caller may have written more bits than nRows and no longer cares to
 	// write them out.
@@ -438,7 +443,7 @@ func (b *BitmapBuilder) Finish(col, nRows int, offset uint32, buf []byte) uint32
 		b.words[nBitmapWords-1] &= (1 << i) - 1
 	}
 
-	nSummaryWords := (nBitmapWords + 63) >> 6
+	nSummaryWords := bitmapWords(nBitmapWords)
 	dest := makeUintsEncoder[uint64](buf[offset:], nBitmapWords+nSummaryWords)
 	// Copy all the words of the bitmap into the destination buffer.
 	dest.CopyFrom(0, b.words)
@@ -488,12 +493,12 @@ func bitmapToBinFormatter(f *binfmt.Formatter, tp treeprinter.Node, rows int) {
 	if aligned := align(f.RelativeOffset(), 8); aligned-f.RelativeOffset() != 0 {
 		f.HexBytesln(aligned-f.RelativeOffset(), "padding to align to 64-bit boundary")
 	}
-	bitmapWords := (rows + 63) / 64
-	for i := 0; i < bitmapWords; i++ {
+	nWords := bitmapWords(rows)
+	for i := range nWords {
 		f.Line(8).Append("b ").Binary(8).Done("bitmap word %d", i)
 	}
-	summaryWords := (bitmapWords + 63) / 64
-	for i := 0; i < summaryWords; i++ {
+	nSummaryWords := bitmapWords(nWords)
+	for i := range nSummaryWords {
 		f.Line(8).Append("b ").Binary(8).Done("bitmap summary word %d-%d", i*64, i*64+63)
 	}
 	f.ToTreePrinter(tp)

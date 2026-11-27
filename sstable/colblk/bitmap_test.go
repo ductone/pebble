@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unicode"
@@ -453,6 +454,24 @@ func TestBitmapDecodeLargeBitCounts(t *testing.T) {
 		_, err := tryDecodeBitmap(small, bitCount)
 		require.True(t, errors.HasAssertionFailure(err), "%v", err)
 	}
+}
+
+// TestBitmapStringZeroEncodings verifies that the zero encoding, which has no
+// words, formats like a default-encoded bitmap whose words are all zero.
+func TestBitmapStringZeroEncodings(t *testing.T) {
+	const rows = 100
+	zeroData, _ := encodeTestBitmap(rows, nil, false /* invert */)
+	require.Equal(t, byte(zeroBitmapEncoding), zeroData[0])
+	// Inverting a fully set bitmap uses the default encoding with zero words.
+	defaultData, _ := encodeTestBitmap(rows, rowRange(0, rows), true /* invert */)
+	require.Equal(t, byte(defaultBitmapEncoding), defaultData[0])
+
+	zero, err := tryDecodeBitmap(zeroData, rows)
+	require.NoError(t, err)
+	def, err := tryDecodeBitmap(defaultData, rows)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("0", 128), zero.String())
+	require.Equal(t, def.String(), zero.String())
 }
 
 var bitmapBenchSink int
