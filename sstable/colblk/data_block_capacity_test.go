@@ -10,6 +10,7 @@ import (
 	"math"
 	"strconv"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/crlib/crbytes"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -281,62 +282,81 @@ func TestDataBlockIterMaterializedKeyCapacityOverflow(t *testing.T) {
 	}
 }
 
-// buildCapacityTestPrefixBytes returns a PrefixBytes holding keys in bundles of
-// two.
-func buildCapacityTestPrefixBytes(keys []string) PrefixBytes {
+// capacityTestKeys are the keys encoded by buildCapacityTestPrefixBytes. In
+// bundles of two they share no column-wide prefix and have the bundle prefixes
+// "apple" and "banana".
+var capacityTestKeys = []string{"apple1", "apple2", "banana1", "banana2"}
+
+// buildCapacityTestPrefixBytes encodes capacityTestKeys in bundles of two with
+// a PrefixBytesBuilder and returns the encoded column and its decoding.
+func buildCapacityTestPrefixBytes() ([]byte, PrefixBytes) {
 	var pbb PrefixBytesBuilder
 	pbb.Init(2)
-	for i, k := range keys {
+	for i, k := range capacityTestKeys {
 		shared := 0
 		if i > 0 {
-			shared = crbytes.CommonPrefix([]byte(keys[i-1]), []byte(k))
+			shared = crbytes.CommonPrefix([]byte(capacityTestKeys[i-1]), []byte(k))
 		}
 		pbb.Put([]byte(k), shared)
 	}
-	buf := make([]byte, pbb.Size(len(keys), 0)+1 /* +1 to avoid checkptr issues */)
-	pbb.Finish(0, len(keys), 0, buf)
-	pb, _ := DecodePrefixBytes(buf, 0, uint32(len(keys)))
-	return pb
+	n := len(capacityTestKeys)
+	buf := make([]byte, pbb.Size(n, 0)+1 /* +1 to avoid checkptr issues */)
+	pbb.Finish(0, n, 0, buf)
+	pb, _ := DecodePrefixBytes(buf, 0, uint32(n))
+	return buf, pb
+}
+
+// canaryIterCapacity is the capacity of the buffer newCanaryPrefixBytesIter
+// hands to a PrefixBytesIter; the backing array continues past it with canary
+// bytes.
+const canaryIterCapacity = 32
+
+// newCanaryPrefixBytesIter returns a PrefixBytesIter whose buffer has
+// canaryIterCapacity bytes of capacity, and the canary-filled backing array the
+// buffer was carved from.
+func newCanaryPrefixBytesIter(
+	t *testing.T, syntheticPrefix string,
+) (*PrefixBytesIter, []byte) {
+	backing := bytes.Repeat([]byte{0xA5}, canaryIterCapacity+32)
+	it := &PrefixBytesIter{Buf: backing[:0:canaryIterCapacity]}
+	it.Init(canaryIterCapacity-1, blockiter.SyntheticPrefix(syntheticPrefix))
+	require.Equal(t, canaryIterCapacity, cap(it.Buf), "Init must reuse the restricted buffer")
+	return it, backing
+}
+
+func requireCanaryIntact(t *testing.T, backing []byte) {
+	t.Helper()
+	for i := canaryIterCapacity; i < len(backing); i++ {
+		require.Equal(t, byte(0xA5), backing[i], "byte %d beyond the capacity was overwritten", i)
+	}
+}
+
+func panics(fn func()) (panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	fn()
+	return false
 }
 
 // TestPrefixBytesIterLengthWidth verifies that SetAt and both SetNext paths
 // compute the materialized key length without wrapping, and check it against
 // the buffer's capacity before copying any bytes.
 //
-// A synthetic prefix and key whose lengths sum past math.MaxUint32 would need
-// gigabytes of memory, so the oversized components are simulated by setting
-// the iterator's length fields directly. Computed in uint32, those lengths wrap
-// to a small value that fits the buffer while the copies land gigabytes past it.
+// Here the oversized components are simulated by setting the iterator's length
+// fields directly, as a valid synthetic prefix and key summing past
+// math.MaxUint32 would need gigabytes of memory. A malformed block reaches the
+// same wrap without large inputs; see TestPrefixBytesIterDecreasingOffset.
+// Computed in uint32, these lengths wrap to a small value that fits the buffer
+// while the copies land gigabytes past it.
 func TestPrefixBytesIterLengthWidth(t *testing.T) {
-	keys := []string{"apple1", "apple2", "banana1", "banana2"}
-	pb := buildCapacityTestPrefixBytes(keys)
-	const capacity = 32
-
-	newIter := func(syntheticPrefix string) (*PrefixBytesIter, []byte) {
-		backing := bytes.Repeat([]byte{0xA5}, capacity+32)
-		it := &PrefixBytesIter{Buf: backing[:0:capacity]}
-		it.Init(capacity-1, blockiter.SyntheticPrefix(syntheticPrefix))
-		require.Equal(t, capacity, cap(it.Buf), "Init must reuse the restricted buffer")
-		return it, backing
-	}
-	requireCanaryIntact := func(t *testing.T, backing []byte) {
-		t.Helper()
-		for i := capacity; i < len(backing); i++ {
-			require.Equal(t, byte(0xA5), backing[i], "byte %d beyond the capacity was overwritten", i)
-		}
-	}
-	panics := func(fn func()) (panicked bool) {
-		defer func() {
-			if recover() != nil {
-				panicked = true
-			}
-		}()
-		fn()
-		return false
-	}
+	keys := capacityTestKeys
+	_, pb := buildCapacityTestPrefixBytes()
 
 	t.Run("ordinary", func(t *testing.T) {
-		it, backing := newIter("pfx_")
+		it, backing := newCanaryPrefixBytesIter(t, "pfx_")
 		pb.SetAt(it, 0)
 		require.Equal(t, "pfx_apple1", string(it.Buf))
 		for i := 1; i < len(keys); i++ {
@@ -348,23 +368,100 @@ func TestPrefixBytesIterLengthWidth(t *testing.T) {
 		requireCanaryIntact(t, backing)
 	})
 	t.Run("SetAt", func(t *testing.T) {
-		it, backing := newIter("")
+		it, backing := newCanaryPrefixBytesIter(t, "")
 		it.syntheticPrefixLen = math.MaxUint32 - 2
 		require.True(t, panics(func() { pb.SetAt(it, 0) }))
 		requireCanaryIntact(t, backing)
 	})
 	t.Run("SetNext/same-bundle", func(t *testing.T) {
-		it, backing := newIter("")
+		it, backing := newCanaryPrefixBytesIter(t, "")
 		pb.SetAt(it, 0)
 		it.sharedAndBundlePrefixLen = math.MaxUint32
 		require.True(t, panics(func() { pb.SetNext(it) }))
 		requireCanaryIntact(t, backing)
 	})
 	t.Run("SetNext/new-bundle", func(t *testing.T) {
-		it, backing := newIter("")
+		it, backing := newCanaryPrefixBytesIter(t, "")
 		pb.SetAt(it, 1)
 		it.syntheticPrefixLen = math.MaxUint32 - 2
 		require.True(t, panics(func() { pb.SetNext(it) }))
 		requireCanaryIntact(t, backing)
 	})
+}
+
+// setEncodedOffset overwrites, in the encoded column bytes, the i'th offset of
+// pb's RawBytes, and requires that the decoded accessor observes the new value.
+func setEncodedOffset(t *testing.T, pb PrefixBytes, i int, v uint32) {
+	t.Helper()
+	o := pb.rawBytes.offsets
+	p := unsafe.Add(o.ptr, uintptr(i)*uintptr(o.width))
+	switch o.width {
+	case 1:
+		require.LessOrEqual(t, v, uint32(math.MaxUint8))
+		*(*uint8)(p) = uint8(v)
+	case 2:
+		require.LessOrEqual(t, v, uint32(math.MaxUint16))
+		*(*uint16)(p) = uint16(v)
+	case 4:
+		*(*uint32)(p) = v
+	default:
+		t.Fatalf("unexpected offset width %d", o.width)
+	}
+	require.Equal(t, v, o.At(i))
+}
+
+// TestPrefixBytesIterDecreasingOffset verifies the destination bounds of
+// SetAt and both SetNext paths against a malformed but small column: a
+// PrefixBytesBuilder-encoded column in which one row's encoded suffix end
+// offset is decreased to one below its start offset. The row suffix length
+// end-start then wraps to math.MaxUint32. Summed in uint32 with the
+// shared and bundle prefix lengths, the materialized length wraps again to a
+// small value that fits the buffer, and the suffix copy then reads and writes
+// about 4 GiB; summed in uint64, slicing the buffer panics before any copy.
+//
+// This test exercises only the destination (Buf) bounds. The source reads
+// from the column's data are bounded by the column's offsets, whose validation
+// is separate. The test depends on DecodePrefixBytes accepting non-monotonic
+// offsets: once RawBytes decoding rejects them, the expected outcome here
+// becomes a decode-time rejection, and this test should be changed to assert
+// that instead.
+func TestPrefixBytesIterDecreasingOffset(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// row is the row whose suffix end offset is decreased.
+		row int
+		// materialize positions a canary-backed iterator at row through the
+		// path under test.
+		materialize func(pb PrefixBytes, it *PrefixBytesIter)
+	}{
+		{name: "SetAt", row: 0, materialize: func(pb PrefixBytes, it *PrefixBytesIter) {
+			pb.SetAt(it, 0)
+		}},
+		{name: "SetNext/same-bundle", row: 1, materialize: func(pb PrefixBytes, it *PrefixBytesIter) {
+			pb.SetAt(it, 0)
+			pb.SetNext(it)
+		}},
+		{name: "SetNext/new-bundle", row: 2, materialize: func(pb PrefixBytes, it *PrefixBytesIter) {
+			pb.SetAt(it, 1)
+			pb.SetNext(it)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, pb := buildCapacityTestPrefixBytes()
+			i := pb.rowSuffixIndex(tc.row)
+			start, end := pb.rawBytes.offsets.At2(i)
+			require.Less(t, start, end)
+			require.Positive(t, start)
+			setEncodedOffset(t, pb, i+1, start-1)
+
+			// Decode the mutated column afresh.
+			pb, _ = DecodePrefixBytes(buf, 0, uint32(len(capacityTestKeys)))
+			start, end = pb.rawBytes.offsets.At2(i)
+			require.Equal(t, uint32(math.MaxUint32), end-start)
+
+			it, backing := newCanaryPrefixBytesIter(t, "")
+			require.True(t, panics(func() { tc.materialize(pb, it) }))
+			requireCanaryIntact(t, backing)
+		})
+	}
 }
