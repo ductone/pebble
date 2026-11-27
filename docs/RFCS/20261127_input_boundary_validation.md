@@ -411,9 +411,12 @@ real reader-open test.
   next-live gap scan on each switch. In a warm-cache benchmark, 4,096 gaps
   raised fetch time from about 85 ns to 4.5 µs; 65,536 gaps took about
   70.6 µs. Ordinary fetches were within 0–3% of baseline; disk cost and
-  the master-branch implementation were not measured. Keep the bounds proof,
-  disclose this case, and compare a one-time/index-lifetime bound with lazy
-  per-switch resolution before changing the cache representation.
+  the master-branch implementation were not measured. Keep the bounds proof
+  and disclose this case; a bounded per-fetcher memo may be a separate
+  optimization. Do not build a dense per-file table from the untrusted virtual
+  count: a zero-width mapping can claim billions of IDs in a small block.
+  Any one-time index must first derive its count from encoded bytes and
+  account for its retained heap. Neither optimization gates the bounds fix.
 - Preserve iteration speed and avoid extra steady-state allocations. Prefer
   one-time constructor validation; use per-row checks only after measuring
   a cold-read regression and proving every dependent path. No initialization
