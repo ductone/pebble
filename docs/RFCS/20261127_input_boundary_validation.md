@@ -297,10 +297,13 @@ remain the columnar foundation.
    `UnsafeFirstSlice` and `Search`. Prove the derived offset indexes in
    representable arithmetic before unchecked access, preserving the
    block-wide shared prefix stored at offset zero. The writer's
-   `TrailingZeros32` encodes shift 32 for a 64-bit bundle size of `1<<32`;
-   the current v2 fork rejects that writer-valid shift. Preserve it on master
-   and test the v2 compatibility change separately. On 32-bit, prove indexes
-   actually dereferenced, not a final partial bundle's unused sentinel.
+   `TrailingZeros32` encodes shift 32 for a 64-bit bundle size of `1<<32`.
+   The initial v2 hotfix rejected that writer-valid shift; the separate
+   [fork v2 compatibility PR #8](https://github.com/ductone/pebble/pull/8)
+   covers writer-valid shifts 31/32 with single-bundle normalization for
+   representable 32-bit readers (386 runtime untested).
+   Preserve shift 32 on master. On 32-bit, prove indexes actually
+   dereferenced, not a final partial bundle's unused sentinel.
    Mutate shifts and index counts, test single/partial bundles and duplicate
    keys across boundaries against writer output; benchmark cold decode
    only if it gains more than an O(1) check.
