@@ -86,13 +86,14 @@ index-block-decoder
       │    └── 78-80: x 4b01 # data[6] = 331
       └── 80-81: x 00 # block padding byte
 
-# Read back the virtual block mappings.
+# Read back the virtual block mappings. A virtual block's values end (end row)
+# where the next non-gap virtual block in the same physical block begins.
 
 remap-virtual-blockid 0 1 2 3 4
 ----
-0 -> block 0, with valueID offset 0
+0 -> block 0, with valueID offset 0, end row 7
 1 -> block 0, with valueID offset 7
-2 -> block 1, with valueID offset 2
+2 -> block 1, with valueID offset 2, end row 3
 3 -> block 1, with valueID offset 3
 4 -> block 2, with valueID offset 4
 
@@ -151,7 +152,7 @@ index-block-decoder
 
 remap-virtual-blockid 0 1 2 3 4 5
 ----
-0 -> block 0, with valueID offset 0
+0 -> block 0, with valueID offset 0, end row 3
 1 -> error: blob: virtual block ID 1 should be unreferenced
 2 -> block 0, with valueID offset 3
 3 -> error: blob: virtual block ID 3 should be unreferenced
@@ -198,3 +199,39 @@ remap-virtual-blockid 0 1
 ----
 0 -> block 0, with valueID offset 0
 1 -> error: blob: virtual block ID 1 maps to physical block index 7 out of range [0, 1)
+
+# A virtual block whose successor in the same physical block begins at a lower
+# valueID offset is rejected.
+
+build
+10 20
+virtual-block-mappings
+0 0 5
+1 0 2
+----
+index-block-decoder
+ └── index block header
+      ├── columnar block header
+      │    ├── 00-04: x 02000000 # virtual block count: 2
+      │    ├── 04-05: x 01       # version 1
+      │    ├── 05-07: x 0200     # 2 columns
+      │    ├── 07-11: x 01000000 # 1 rows
+      │    ├── 11-12: b 00000010 # col 0: uint
+      │    ├── 12-16: x 15000000 # col 0: page start 21
+      │    ├── 16-17: b 00000010 # col 1: uint
+      │    └── 17-21: x 28000000 # col 1: page start 40
+      ├── data for column 0 (uint)
+      │    ├── 21-22: x 08               # encoding: 8b
+      │    ├── 22-24: x 0000             # padding (aligning to 64-bit boundary)
+      │    ├── 24-32: x 0000000005000000 # data[0] = 21474836480
+      │    └── 32-40: x 0000000002000000 # data[1] = 8589934592
+      ├── data for column 1 (uint)
+      │    ├── 40-41: x 01 # encoding: 1b
+      │    ├── 41-42: x 0a # data[0] = 10
+      │    └── 42-43: x 23 # data[1] = 35
+      └── 43-44: x 00 # block padding byte
+
+remap-virtual-blockid 0 1
+----
+0 -> error: blob: virtual block ID 1 has valueID offset 2, preceding offset 5 of virtual block ID 0 in physical block 0
+1 -> block 0, with valueID offset 2

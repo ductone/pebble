@@ -6,6 +6,7 @@ package blob
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2/internal/base"
@@ -215,6 +216,11 @@ type cachedReader struct {
 		// get the index of the value within the physical block for any blob
 		// handles encoding a block ID of virtualID.
 		valueIDOffset BlockValueID
+		// endRow is the exclusive upper bound on the physical row index of
+		// values of virtualID: the physical block's row count, or the
+		// valueIDOffset of the next virtual block within the same physical
+		// block if lower.
+		endRow uint64
 		// physicalIndex is the physical index of the current value block.
 		// physicalIndex is in the range [0, indexBlock.dec.BlockCount()).
 		physicalIndex int
@@ -258,9 +264,10 @@ func (cr *cachedReader) GetUnsafeValue(
 		// the value within the physical block.
 		var physicalBlockIndex int = int(vh.BlockID)
 		var valueIDOffset BlockValueID
+		var endRow uint64 = math.MaxUint64
 		if cr.indexBlock.dec.virtualBlockCount > 0 {
 			var err error
-			physicalBlockIndex, valueIDOffset, err = cr.indexBlock.dec.RemapVirtualBlockID(vh.BlockID)
+			physicalBlockIndex, valueIDOffset, endRow, err = cr.indexBlock.dec.RemapVirtualBlockID(vh.BlockID)
 			if err != nil {
 				return nil, errors.Wrapf(err, "blob file %s", vh.BlobFileID)
 			}
@@ -291,6 +298,7 @@ func (cr *cachedReader) GetUnsafeValue(
 		cr.currentValueBlock.physicalIndex = physicalBlockIndex
 		cr.currentValueBlock.virtualID = vh.BlockID
 		cr.currentValueBlock.valueIDOffset = valueIDOffset
+		cr.currentValueBlock.endRow = min(endRow, uint64(cr.currentValueBlock.dec.bd.Rows()))
 		cr.currentValueBlock.loaded = true
 	}
 
@@ -299,9 +307,11 @@ func (cr *cachedReader) GetUnsafeValue(
 	// is rewritten, multiple blocks from the original blob file may be combined
 	// into the same physical block. To translate the ValueID to the
 	// apppropriate index, we need to add the 'virtual block' valueIDOffset.
-	// The sum is computed in 64 bits so that it cannot wrap.
+	// The sum is computed in 64 bits so that it cannot wrap. It must fall
+	// within the virtual block's rows of the physical block, so that a value
+	// ID cannot resolve to a value of a different virtual block.
 	valueIndex := uint64(valueID) + uint64(cr.currentValueBlock.valueIDOffset)
-	if valueIndex >= uint64(cr.currentValueBlock.dec.bd.Rows()) {
+	if valueIndex >= cr.currentValueBlock.endRow {
 		return nil, cr.valueIndexOutOfRangeError(vh)
 	}
 	v := cr.currentValueBlock.dec.values.Slice(cr.currentValueBlock.dec.values.Offsets(int(valueIndex)))
@@ -309,13 +319,14 @@ func (cr *cachedReader) GetUnsafeValue(
 }
 
 // valueIndexOutOfRangeError constructs the error returned when vh's value ID
-// is out of range of the currently loaded value block. It is kept out of
+// is out of range of the currently loaded virtual block. It is kept out of
 // GetUnsafeValue to keep error construction off the hot path.
 //
 //go:noinline
 func (cr *cachedReader) valueIndexOutOfRangeError(vh Handle) error {
-	return base.CorruptionErrorf("blob file %s: value ID %d with offset %d out of range [0, %d) in physical block %d",
-		vh.BlobFileID, errors.Safe(vh.ValueID), errors.Safe(cr.currentValueBlock.valueIDOffset),
+	return base.CorruptionErrorf("blob file %s: value ID %d of block ID %d out of range: physical rows [%d, %d) of %d in physical block %d",
+		vh.BlobFileID, errors.Safe(vh.ValueID), errors.Safe(vh.BlockID),
+		errors.Safe(cr.currentValueBlock.valueIDOffset), errors.Safe(cr.currentValueBlock.endRow),
 		errors.Safe(cr.currentValueBlock.dec.bd.Rows()), errors.Safe(cr.currentValueBlock.physicalIndex))
 }
 
