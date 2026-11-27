@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"github.com/cockroachdb/crlib/crhumanize"
 	"github.com/cockroachdb/errors"
@@ -485,11 +484,6 @@ func (f *fileFooter) encode() []byte {
 type FileReader struct {
 	r      block.Reader
 	footer fileFooter
-	// virtualBlockEndRows holds the end rows of a rewritten file's virtual
-	// blocks (see indexBlockDecoder.virtualBlockEndRows). It is computed once,
-	// the first time a fetcher loads the index block of a rewritten file, and
-	// shared by all fetchers reading the file.
-	virtualBlockEndRows atomic.Pointer[[]uint32]
 }
 
 // Assert that FileReader implements the ValueReader interface.
@@ -543,22 +537,6 @@ func NewFileReader(
 	}
 	fr.r.Init(r, ro.ReaderOptions, fr.footer.checksumType)
 	return fr, nil
-}
-
-// getVirtualBlockEndRows returns the end rows of the file's virtual blocks,
-// computing them from the provided decoder of the file's index block the first
-// time it is called.
-//
-// REQUIRES: d.virtualBlockCount > 0
-func (r *FileReader) getVirtualBlockEndRows(d *indexBlockDecoder) []uint32 {
-	if p := r.virtualBlockEndRows.Load(); p != nil {
-		return *p
-	}
-	endRows := d.virtualBlockEndRows()
-	// Concurrent callers may compute the end rows more than once; they are
-	// identical, and all callers return the first one stored.
-	r.virtualBlockEndRows.CompareAndSwap(nil, &endRows)
-	return *r.virtualBlockEndRows.Load()
 }
 
 // Close implements io.Closer, closing the underlying Readable.
