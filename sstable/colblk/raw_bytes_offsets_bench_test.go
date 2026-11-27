@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/compression"
+	"github.com/cockroachdb/pebble/internal/crc"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/blockiter"
@@ -82,20 +85,19 @@ func coldLoadBenchBlocks() []coldLoadBenchBlock {
 	return blocks
 }
 
-// BenchmarkDataBlockColdLoad compares loading a data block on a block cache
-// miss with warm iteration over the same writer-produced block.
+// BenchmarkDataBlockColdLoad measures loading a writer-produced data block on
+// a block cache miss, which is where decoder validation runs. Warm iteration
+// over an already loaded block is covered by BenchmarkDataBlockIter.
 //
-//   - cold/load+seek models a cache miss followed by one sparse seek: allocate a
-//     block buffer, copy the block into it (standing in for the read), initialize
-//     the cached block metadata, initialize an iterator over the handle, and
-//     SeekGE to one key.
-//   - cold/metadata isolates the block metadata initialization, which is where
-//     decoder validation runs on a cache miss.
-//   - warm/seek and warm/next use an iterator over a block whose metadata was
-//     initialized once, as for a block cache hit.
+//   - metadata isolates the block metadata initialization.
+//   - load+seek allocates a block buffer, copies the uncompressed block into it,
+//     initializes the block metadata and an iterator over the handle, and seeks
+//     to one key.
+//   - miss/<algorithm> models an in-memory block read: copy the compressed block
+//     into a buffer, checksum it, decompress it into a block buffer, then
+//     initialize and seek as above. It excludes I/O.
 //
-// Constructor validation that is O(rows) appears only in the cold
-// sub-benchmarks. Run with -count and compare against a base with benchstat.
+// Run with -count and compare against a base with benchstat.
 func BenchmarkDataBlockColdLoad(b *testing.B) {
 	getValuer := getInternalValuer(func([]byte) base.InternalValue {
 		return base.MakeInPlaceValue(nil)
@@ -103,17 +105,31 @@ func BenchmarkDataBlockColdLoad(b *testing.B) {
 	for _, blk := range coldLoadBenchBlocks() {
 		b.Run(blk.name, func(b *testing.B) {
 			var pool block.BufferPool
-			pool.Init(2, block.ForCompaction)
+			pool.Init(4, block.ForCompaction)
 			defer pool.Release()
 
-			b.Run("cold/load+seek", func(b *testing.B) {
+			b.Run("metadata", func(b *testing.B) {
+				v := block.Alloc(len(blk.data), &pool)
+				defer v.Release()
+				copy(v.BlockData(), blk.data)
+				b.SetBytes(int64(len(blk.data)))
+				for b.Loop() {
+					if err := InitDataBlockMetadata(&testKeysSchema, v.BlockMetadata(), v.BlockData()); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+
+			// loadAndSeek calls fill to populate a newly allocated block buffer,
+			// then initializes the block metadata and an iterator, and seeks.
+			loadAndSeek := func(b *testing.B, fill func(dst []byte)) {
 				var it DataBlockIter
 				it.InitOnce(&testKeysSchema, testkeys.Comparer, getValuer, NoTieringColumns())
 				idx := 0
 				b.SetBytes(int64(len(blk.data)))
 				for b.Loop() {
 					v := block.Alloc(len(blk.data), &pool)
-					copy(v.BlockData(), blk.data)
+					fill(v.BlockData())
 					if err := InitDataBlockMetadata(&testKeysSchema, v.BlockMetadata(), v.BlockData()); err != nil {
 						b.Fatal(err)
 					}
@@ -130,55 +146,33 @@ func BenchmarkDataBlockColdLoad(b *testing.B) {
 					}
 				}
 				_ = it.Close()
-			})
-
-			b.Run("cold/metadata", func(b *testing.B) {
-				v := block.Alloc(len(blk.data), &pool)
-				defer v.Release()
-				copy(v.BlockData(), blk.data)
-				b.SetBytes(int64(len(blk.data)))
-				for b.Loop() {
-					if err := InitDataBlockMetadata(&testKeysSchema, v.BlockMetadata(), v.BlockData()); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-
-			v := block.Alloc(len(blk.data), &pool)
-			copy(v.BlockData(), blk.data)
-			if err := InitDataBlockMetadata(&testKeysSchema, v.BlockMetadata(), v.BlockData()); err != nil {
-				b.Fatal(err)
 			}
-			var it DataBlockIter
-			it.InitOnce(&testKeysSchema, testkeys.Comparer, getValuer, NoTieringColumns())
-			if err := it.InitHandle(testkeys.Comparer, v.MakeHandle(), blockiter.Transforms{}); err != nil {
-				b.Fatal(err)
+
+			b.Run("load+seek", func(b *testing.B) {
+				loadAndSeek(b, func(dst []byte) { copy(dst, blk.data) })
+			})
+
+			for _, setting := range []compression.Setting{compression.MinLZFastest, compression.SnappySetting} {
+				c := compression.GetCompressor(setting)
+				compressed, used := c.Compress(nil, blk.data)
+				c.Close()
+				checksum := crc.New(compressed).Value()
+				b.Run("miss/"+used.String(), func(b *testing.B) {
+					d := compression.GetDecompressor(used.Algorithm)
+					defer d.Close()
+					loadAndSeek(b, func(dst []byte) {
+						raw := block.Alloc(len(compressed), &pool)
+						defer raw.Release()
+						copy(raw.BlockData(), compressed)
+						if crc.New(raw.BlockData()).Value() != checksum {
+							b.Fatal("checksum mismatch")
+						}
+						if err := d.DecompressInto(dst, raw.BlockData()); err != nil {
+							b.Fatal(err)
+						}
+					})
+				})
 			}
-			defer func() { _ = it.Close() }()
-
-			b.Run("warm/seek", func(b *testing.B) {
-				idx := 0
-				for b.Loop() {
-					if kv := it.SeekGE(blk.seekKeys[idx], base.SeekGEFlagsNone); kv == nil {
-						b.Fatal("key not found")
-					}
-					idx++
-					if idx == len(blk.seekKeys) {
-						idx = 0
-					}
-				}
-			})
-
-			b.Run("warm/next", func(b *testing.B) {
-				kv := it.First()
-				for b.Loop() {
-					if kv == nil {
-						kv = it.First()
-					} else {
-						kv = it.Next()
-					}
-				}
-			})
 		})
 	}
 }
@@ -220,4 +214,39 @@ func rawBytesBlockForBench(vals [][]byte) []byte {
 		rb.Put(v)
 	}
 	return FinishBlock(len(vals), []ColumnWriter{&rb})
+}
+
+// BenchmarkRawBytesAtEmpty measures RawBytes.At over columns of nonempty,
+// empty and alternating slices.
+func BenchmarkRawBytesAtEmpty(b *testing.B) {
+	const n = 1024
+	for _, tc := range []struct {
+		name  string
+		empty func(i int) bool
+	}{
+		{"nonempty", func(int) bool { return false }},
+		{"empty", func(int) bool { return true }},
+		{"alternating", func(i int) bool { return i%2 == 1 }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			vals := make([][]byte, n)
+			for i := range vals {
+				if !tc.empty(i) {
+					vals[i] = []byte("12345678")
+				}
+			}
+			d := DecodeBlock(rawBytesBlockForBench(vals), 0)
+			rb := d.RawBytes(0)
+			var sink uintptr
+			for b.Loop() {
+				for i := range n {
+					s := rb.At(i)
+					sink += uintptr(len(s)) + uintptr(unsafe.Pointer(unsafe.SliceData(s)))
+				}
+			}
+			if sink == 0 {
+				b.Fatal("unexpected sink")
+			}
+		})
+	}
 }

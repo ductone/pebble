@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/crlib/crbytes"
 	"github.com/cockroachdb/errors"
@@ -289,14 +290,66 @@ func TestRawBytesWidthZeroLargeCount(t *testing.T) {
 	table, w := offsetsTable(t, &d, 0, 3, false)
 	require.Equal(t, 0, w)
 	require.Empty(t, table)
-	for _, count := range []uint32{3, 1 << 30, math.MaxUint32 - 1} {
-		rb := DecodeColumn(&d, 0, count, DataTypeBytes, DecodeRawBytes)
-		if uint64(count) <= math.MaxInt {
+	counts := []uint32{3, 1 << 30, math.MaxUint32 - 1}
+	// On 32-bit platforms, the largest count an accessor can represent is
+	// math.MaxInt; larger counts are rejected rather than stored as a negative
+	// number of slices.
+	if maxInt := uint64(math.MaxInt); maxInt < math.MaxUint32 {
+		counts = append(counts, uint32(maxInt), uint32(maxInt)+1)
+	}
+	for _, count := range counts {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			if uint64(count) > math.MaxInt {
+				requireOffsetsAssertion(t, func() { DecodeColumn(&d, 0, count, DataTypeBytes, DecodeRawBytes) })
+				return
+			}
+			rb := DecodeColumn(&d, 0, count, DataTypeBytes, DecodeRawBytes)
 			require.Equal(t, int(count), rb.Slices())
-			require.Empty(t, rb.At(int(count-1)))
-		}
+			require.Positive(t, rb.Slices())
+			v := rb.At(int(count - 1))
+			require.NotNil(t, v)
+			require.Empty(t, v)
+		})
 	}
 	requireOffsetsAssertion(t, func() { DecodeColumn(&d, 0, math.MaxUint32, DataTypeBytes, DecodeRawBytes) })
+}
+
+// TestRawBytesExactBufferEmptyLastSlice decodes RawBytesBuilder output from a
+// buffer of exactly the encoded size, whose final slice is empty, so that the
+// data section ends at the end of the buffer. Empty slices, including the
+// final one, must be non-nil and must not point past the buffer.
+func TestRawBytesExactBufferEmptyLastSlice(t *testing.T) {
+	for _, vals := range [][][]byte{
+		{[]byte("abc"), nil},
+		{[]byte("abc"), {}, []byte("de"), nil},
+		{[]byte("abc"), {}, {}},
+	} {
+		var w RawBytesBuilder
+		w.Init()
+		for _, v := range vals {
+			w.Put(v)
+		}
+		n := len(vals)
+		size := int(w.Size(n, 0))
+		buf := crbytes.AllocAligned(size)[:size:size]
+		require.Equal(t, uint32(size), w.Finish(0, n, 0, buf))
+		rb, end := DecodeRawBytes(buf, 0, uint32(n))
+		// The data section ends exactly at the end of the buffer.
+		require.Equal(t, uint64(len(buf)), end)
+		lo := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
+		hi := lo + uintptr(len(buf))
+		for i, v := range vals {
+			got := rb.At(i)
+			require.NotNil(t, got)
+			require.Equal(t, len(v), len(got))
+			require.Equal(t, len(v), cap(got))
+			require.True(t, bytes.Equal(v, got))
+			p := uintptr(unsafe.Pointer(unsafe.SliceData(got)))
+			require.True(t, lo <= p && p < hi, "slice %d points outside the buffer", i)
+			start, end := rb.Offsets(i)
+			require.Equal(t, got, rb.Slice(start, end))
+		}
+	}
 }
 
 func requireCorruption(t *testing.T, err error) {

@@ -73,8 +73,10 @@ func DecodeRawBytes(b []byte, offset uint64, count uint32) (rawBytes RawBytes, e
 	if count == 0 {
 		return RawBytes{}, offset
 	}
-	if count == math.MaxUint32 {
-		panic(errors.AssertionFailedf("count overflow"))
+	// The accessor stores the count as an int; on 32-bit platforms a valid
+	// width-zero column cannot represent more than math.MaxInt slices.
+	if count == math.MaxUint32 || uint64(count) > math.MaxInt {
+		panic(errors.AssertionFailedf("count overflow: %d", errors.Safe(count)))
 	}
 	offsets, dataOff := DecodeUnsafeOffsets(b, offset, count+1 /* +1 offset */)
 	// The offsets table occupies the tableLen bytes immediately preceding
@@ -229,9 +231,17 @@ func (b *RawBytes) ptr(offset uint32) unsafe.Pointer {
 // (indexes in [0, Slices()], start's index <= end's index); DecodeRawBytes
 // proved those offsets are nondecreasing and within the data section.
 //
+// An empty slice may start at the end of the data section, which can be the end
+// of the decoded buffer. An empty result is anchored at the start of the data
+// section instead, so the returned slice never points past the buffer.
+//
 //gcassert:inline
 func (b *RawBytes) Slice(start, end uint32) []byte {
-	return unsafe.Slice((*byte)(b.ptr(start)), end-start)
+	n := end - start
+	if n == 0 {
+		start = 0
+	}
+	return unsafe.Slice((*byte)(b.ptr(start)), n)
 }
 
 // Offsets returns the start and end offsets of the i'th slice. The index is
