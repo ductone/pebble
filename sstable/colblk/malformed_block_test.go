@@ -108,6 +108,7 @@ func TestDecodeColumnConfinesDecoder(t *testing.T) {
 		DecodeColumn(&d, col, 3, DataTypeUint, func(b []byte, off uint64, rows uint32) (UnsafeUints, uint64) {
 			// The decoder may address the byte following its page, but no more.
 			require.Equal(t, end+1, uint64(len(b)))
+			require.Equal(t, end+1, uint64(cap(b)))
 			return DecodeUnsafeUints(b, off, rows)
 		})
 	}

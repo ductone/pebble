@@ -294,11 +294,12 @@ func DecodeColumn[V any](
 		panic(errors.AssertionFailedf("column %d is type %s; not %s", errors.Safe(col), dt, dataType))
 	}
 	// Init verified that the column's page lies within the block and is
-	// followed by at least one byte. Confine decodeFunc to the page and that
-	// byte, which only serves as a valid address for an empty column: the
-	// decoded column must end exactly at the end of its page.
+	// followed by at least one byte. Limit decodeFunc to the page and that
+	// byte, which allows an empty column to construct a valid pointer. A
+	// malformed column may read the byte, but the decoded column must end
+	// exactly at the end of its page.
 	end := d.pageStart(col + 1)
-	v, endOffset := decodeFunc(d.data[:end+1], d.pageStart(col), rows)
+	v, endOffset := decodeFunc(d.data[:end+1:end+1], d.pageStart(col), rows)
 	if endOffset != end {
 		panic(errors.AssertionFailedf("column %d decoded to offset %d; expected %d", errors.Safe(col), errors.Safe(endOffset), errors.Safe(end)))
 	}
