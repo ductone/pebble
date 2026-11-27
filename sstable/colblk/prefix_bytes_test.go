@@ -132,14 +132,13 @@ func TestPrefixBytesLargeBundle(t *testing.T) {
 		return buf
 	}
 	buf := encode(4)
-	buf[0] = 32
-	if bits.UintSize == 64 {
-		bundleSize := uint64(1) << 32
-		require.Equal(t, buf, encode(int(bundleSize)))
-	}
 	for _, shift := range []byte{31, 32} {
 		t.Run(fmt.Sprintf("shift=%d", shift), func(t *testing.T) {
 			buf[0] = shift
+			if bits.UintSize == 64 {
+				bundleSize := uint64(1) << shift
+				require.Equal(t, buf, encode(int(bundleSize)))
+			}
 			pb, decodedEnd := DecodePrefixBytes(buf, 0, len(keys))
 			require.Equal(t, uint32(len(buf)-1), decodedEnd)
 			for i, key := range keys {
@@ -175,7 +174,15 @@ func TestPrefixBytesInvalidBundleShift(t *testing.T) {
 		expectCorruptBlock(t, func() { DecodePrefixBytes(buf, 0, 1) })
 	}
 	if bits.UintSize == 32 {
-		expectCorruptBlock(t, func() { DecodePrefixBytes([]byte{32, 0}, 0, 1<<30+1) })
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil || !strings.Contains(fmt.Sprint(r), "invalid PrefixBytes bundle shift") {
+					t.Fatalf("expected shift/count assertion, got %v", r)
+				}
+			}()
+			DecodePrefixBytes([]byte{32, 0}, 0, 1<<30+1)
+		}()
 	}
 }
 
