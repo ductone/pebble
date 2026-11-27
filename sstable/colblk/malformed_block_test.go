@@ -264,8 +264,8 @@ func FuzzDataBlockDecode(f *testing.F) {
 	})
 }
 
-// FuzzSpecializedColumnarBlocks covers index and keyspan blocks, whose custom
-// headers and column row counts differ from ordinary data blocks.
+// FuzzSpecializedColumnarBlocks covers index, keyspan, key-value and
+// reference-liveness blocks, whose headers and row counts differ.
 func FuzzSpecializedColumnarBlocks(f *testing.F) {
 	var indexWriter IndexBlockWriter
 	indexWriter.Init()
@@ -277,6 +277,16 @@ func FuzzSpecializedColumnarBlocks(f *testing.F) {
 	spanWriter.Init(bytes.Equal)
 	spanWriter.AddSpan(keyspan.ParseSpan("a-c:{(#100,RANGEDEL)}"))
 	f.Add(uint8(1), spanWriter.Finish())
+
+	var kvWriter KeyValueBlockWriter
+	kvWriter.Init()
+	kvWriter.AddKV([]byte("key"), []byte("value"))
+	f.Add(uint8(2), kvWriter.Finish(kvWriter.Rows()))
+
+	var liveWriter ReferenceLivenessBlockEncoder
+	liveWriter.Init()
+	liveWriter.AddReferenceLiveness(0, []byte{1, 2})
+	f.Add(uint8(3), liveWriter.Finish())
 	f.Fuzz(func(t *testing.T, format uint8, data []byte) {
 		if len(data) > 64<<10 {
 			return
@@ -289,7 +299,7 @@ func FuzzSpecializedColumnarBlocks(f *testing.F) {
 			}
 		}()
 		var md block.Metadata
-		switch format % 2 {
+		switch format % 4 {
 		case 0:
 			if InitIndexBlockMetadata(&md, data) != nil {
 				return
@@ -320,6 +330,25 @@ func FuzzSpecializedColumnarBlocks(f *testing.F) {
 			for n := 0; span != nil && err == nil && n < 32; n++ {
 				_, _ = span.Start, span.End
 				span, err = iter.Next()
+			}
+		case 2:
+			var d KeyValueBlockDecoder
+			d.Init(data)
+			if d.bd.Rows() > 32 {
+				return
+			}
+			for row := range int(d.bd.Rows()) {
+				d.KeyAt(row)
+				d.ValueAt(row)
+			}
+		case 3:
+			var d ReferenceLivenessBlockDecoder
+			d.Init(data)
+			if d.bd.Rows() > 32 {
+				return
+			}
+			for row := range int(d.bd.Rows()) {
+				d.LivenessAtReference(row)
 			}
 		}
 	})
