@@ -37,26 +37,72 @@ type Bitmap struct {
 var _ Array[bool] = Bitmap{}
 
 // DecodeBitmap decodes the structure of a Bitmap and returns a Bitmap that
-// reads from b supporting bitCount logical bits. No bounds checking is
-// performed, so the caller must guarantee the bitmap is appropriately sized and
-// the provided bitCount correctly identifies the number of bits in the bitmap.
+// reads from b supporting bitCount logical bits. The provided bitCount must
+// correctly identify the number of bits in the bitmap.
+//
+// DecodeBitmap panics if the encoding is unknown, if b is too small to hold the
+// bitmap, or if a default-encoded bitmap violates the invariants checked by
+// validateEncoding.
 func DecodeBitmap(b []byte, off uint64, bitCount uint32) (bitmap Bitmap, endOffset uint64) {
-	encoding := bitmapEncoding(b[off])
-	off++
-	if encoding == zeroBitmapEncoding {
-		return Bitmap{bitCount: int(bitCount)}, off
+	n := int(bitCount)
+	if n < 0 {
+		// Only possible on 32-bit platforms.
+		panic(errors.AssertionFailedf("bitmap of %d bits exceeds the maximum int", errors.Safe(bitCount)))
 	}
-	off = align(off, align64)
-	sz := bitmapRequiredSize(int(bitCount))
-	endOffset = off + uint64(sz)
+	switch encoding := bitmapEncoding(b[off]); encoding {
+	case zeroBitmapEncoding:
+		return Bitmap{bitCount: n}, off + 1
+	case defaultBitmapEncoding:
+	default:
+		panic(errors.AssertionFailedf("unknown bitmap encoding %d", errors.Safe(encoding)))
+	}
+	off = align(off+1, align64)
+	nWords := bitmapWords(n)
+	nSummaryWords := bitmapWords(nWords)
+	sz := uint64(nWords+nSummaryWords) << align64Shift
+	endOffset = off + sz
 	if endOffset > uint64(len(b)) {
-		panic(errors.AssertionFailedf("bitmap of %d bits requires at least %d bytes; provided with %d-byte slice",
-			errors.Safe(bitCount), errors.Safe(sz), errors.Safe(len(b[off:]))))
+		panic(errors.AssertionFailedf("bitmap of %d bits at offset %d requires %d bytes; provided with %d-byte slice",
+			errors.Safe(bitCount), errors.Safe(off), errors.Safe(sz), errors.Safe(len(b))))
 	}
-	return Bitmap{
-		data:     makeUnsafeUint64Decoder(b[off:], sz>>align64Shift),
-		bitCount: int(bitCount),
-	}, endOffset
+	bitmap = Bitmap{
+		data:     makeUnsafeUint64Decoder(b[off:], nWords+nSummaryWords),
+		bitCount: n,
+	}
+	bitmap.validateEncoding(nWords, nSummaryWords)
+	return bitmap, endOffset
+}
+
+// validateEncoding panics unless a default-encoded bitmap satisfies the two
+// invariants BitmapBuilder.Finish guarantees: no bit beyond bitCount is set,
+// and each summary bit is set if and only if its primary word is non-zero. The
+// seek methods rely on both to bound their unchecked reads and results.
+func (b Bitmap) validateEncoding(nWords, nSummaryWords int) {
+	if r := uint(b.bitCount) & 63; r != 0 && b.data.At(nWords-1)>>r != 0 {
+		panic(errors.AssertionFailedf("bitmap of %d bits has bits set beyond its bit count",
+			errors.Safe(b.bitCount)))
+	}
+	for i := range nSummaryWords {
+		wordsOff := i << 6
+		var expected uint64
+		for j := range min(64, nWords-wordsOff) {
+			if b.data.At(wordsOff+j) != 0 {
+				expected |= 1 << j
+			}
+		}
+		if got := b.data.At(nWords + i); got != expected {
+			panic(errors.AssertionFailedf("bitmap of %d bits has summary word %d = %#016x; expected %#016x",
+				errors.Safe(b.bitCount), errors.Safe(i), errors.Safe(got), errors.Safe(expected)))
+		}
+	}
+}
+
+// bitmapWords returns ⌈n/64⌉, the number of 64-bit words holding n ≥ 0 bits.
+// Unlike (n+63)>>6, it cannot overflow for n close to math.MaxInt.
+//
+//gcassert:inline
+func bitmapWords(n int) int {
+	return int((uint(n) + 63) >> 6)
 }
 
 // Assert that DecodeBitmap implements DecodeFunc.
@@ -187,7 +233,7 @@ func (b Bitmap) SeekUnsetBitGE(i int) int {
 	if next := nextBitInWord(^b.data.At(wordIdx), uint(i)&63); next < 64 {
 		return wordIdx<<6 + next
 	}
-	numWords := (b.bitCount + 63) >> 6
+	numWords := bitmapWords(b.bitCount)
 	var word uint64
 	for wordIdx++; ; wordIdx++ {
 		if wordIdx >= numWords {
@@ -232,16 +278,21 @@ func (b Bitmap) SeekUnsetBitLE(i int) int {
 // summaryTableBounds returns the indexes of the bitmap words containing the
 // summary table. The summary table's words lie within [startOffset, endOffset).
 func (b Bitmap) summaryTableBounds() (startOffset, endOffset int) {
-	startOffset = (b.bitCount + 63) >> 6
-	endOffset = startOffset + (startOffset+63)>>6
+	startOffset = bitmapWords(b.bitCount)
+	endOffset = startOffset + bitmapWords(startOffset)
 	return startOffset, endOffset
 }
 
 // String returns a string representation of the entire bitmap.
 func (b Bitmap) String() string {
 	var sb strings.Builder
-	for w := 0; w < (b.bitCount+63)/64; w++ {
-		fmt.Fprintf(&sb, "%064b", b.data.At(w))
+	for w := range bitmapWords(b.bitCount) {
+		var word uint64
+		if b.data.ptr != nil {
+			// The zero bitmap encoding has no words.
+			word = b.data.At(w)
+		}
+		fmt.Fprintf(&sb, "%064b", word)
 	}
 	return sb.String()
 }
@@ -271,8 +322,8 @@ var _ ColumnWriter = (*BitmapBuilder)(nil)
 // bitmapRequiredSize returns the size of an encoded bitmap in bytes, using the
 // defaultBitmapEncoding.
 func bitmapRequiredSize(total int) int {
-	nWords := (total + 63) >> 6          // divide by 64
-	nSummaryWords := (nWords + 63) >> 6  // divide by 64
+	nWords := bitmapWords(total)
+	nSummaryWords := bitmapWords(nWords)
 	return (nWords + nSummaryWords) << 3 // multiply by 8
 }
 
@@ -354,7 +405,7 @@ func (b *BitmapBuilder) Invert(nRows int) {
 	// finished encoding any rows at all, it uses the default encoding.
 	b.minNonZeroRowCount = 1
 	// If the tail of b is sparse, fill in zeroes before inverting.
-	nBitmapWords := (nRows + 63) >> 6
+	nBitmapWords := bitmapWords(nRows)
 	for len(b.words) < nBitmapWords {
 		// We append zeros because if b.words has additional capacity, it has
 		// not been zeroed.
@@ -377,7 +428,7 @@ func (b *BitmapBuilder) Finish(col, nRows int, offset uint32, buf []byte) uint32
 	offset++
 	offset = alignWithZeroes(buf, offset, align64)
 
-	nBitmapWords := (nRows + 63) >> 6
+	nBitmapWords := bitmapWords(nRows)
 	// Truncate the bitmap to the number of words required to represent nRows.
 	// The caller may have written more bits than nRows and no longer cares to
 	// write them out.
@@ -392,7 +443,7 @@ func (b *BitmapBuilder) Finish(col, nRows int, offset uint32, buf []byte) uint32
 		b.words[nBitmapWords-1] &= (1 << i) - 1
 	}
 
-	nSummaryWords := (nBitmapWords + 63) >> 6
+	nSummaryWords := bitmapWords(nBitmapWords)
 	dest := makeUintsEncoder[uint64](buf[offset:], nBitmapWords+nSummaryWords)
 	// Copy all the words of the bitmap into the destination buffer.
 	dest.CopyFrom(0, b.words)
@@ -442,12 +493,12 @@ func bitmapToBinFormatter(f *binfmt.Formatter, tp treeprinter.Node, rows int) {
 	if aligned := align(f.RelativeOffset(), 8); aligned-f.RelativeOffset() != 0 {
 		f.HexBytesln(aligned-f.RelativeOffset(), "padding to align to 64-bit boundary")
 	}
-	bitmapWords := (rows + 63) / 64
-	for i := 0; i < bitmapWords; i++ {
+	nWords := bitmapWords(rows)
+	for i := range nWords {
 		f.Line(8).Append("b ").Binary(8).Done("bitmap word %d", i)
 	}
-	summaryWords := (bitmapWords + 63) / 64
-	for i := 0; i < summaryWords; i++ {
+	nSummaryWords := bitmapWords(nWords)
+	for i := range nSummaryWords {
 		f.Line(8).Append("b ").Binary(8).Done("bitmap summary word %d-%d", i*64, i*64+63)
 	}
 	f.ToTreePrinter(tp)

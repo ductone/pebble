@@ -7,6 +7,7 @@ package colblk
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/binfmt"
 	"github.com/cockroachdb/pebble/internal/itertest"
@@ -23,6 +25,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/blockiter"
+	"github.com/stretchr/testify/require"
 )
 
 var testKeysSchema = DefaultKeySchema(testkeys.Comparer, 16)
@@ -550,5 +553,59 @@ func BenchmarkDataBlockDecoderInit(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		InitDataBlockMetadata(&testKeysSchema, &md, finished)
+	}
+}
+
+// TestDataBlockDecoderRejectsMalformedBitmap verifies that malformed bitmap
+// columns are rejected when a data block decoder is initialized: as an
+// assertion failure panic from BlockDecoder.Bitmap and as a corruption error
+// from InitDataBlockMetadata.
+func TestDataBlockDecoderRejectsMalformedBitmap(t *testing.T) {
+	var w DataBlockEncoder
+	w.Init(&testKeysSchema, NoTieringColumns())
+	for i, k := range []string{"a#3,SET", "b#2,SET", "c#1,SET"} {
+		ik := base.ParseInternalKey(k)
+		kcmp := w.KeyWriter.ComparePrev(ik.UserKey)
+		vp := block.InPlaceValuePrefix(kcmp.PrefixEqual())
+		w.Add(ik, []byte("v"), vp, kcmp, i == 1 /* isObsolete */, base.KVMeta{})
+	}
+	data, _ := w.Finish(w.Rows(), w.Size())
+	customHeaderSize := DataBlockCustomHeaderSize + testKeysSchema.HeaderSize
+	var md block.Metadata
+	require.NoError(t, InitDataBlockMetadata(&testKeysSchema, &md, data))
+
+	mutations := []struct {
+		name string
+		// The bitmap word (primary words followed by summary words) and bit to
+		// flip. The 3-row bitmaps have one primary word and one summary word.
+		word int
+		bit  int
+	}{
+		{name: "summary bit beyond primary words", word: 1, bit: 1},
+		{name: "padding bit beyond row count", word: 0, bit: 5},
+	}
+	for _, dataCol := range []int{dataBlockColumnPrefixChanged, dataBlockColumnIsObsolete} {
+		col := len(testKeysSchema.ColumnTypes) + dataCol
+		for _, m := range mutations {
+			t.Run(fmt.Sprintf("col=%d/%s", col, m.name), func(t *testing.T) {
+				mutated := slices.Clone(data)
+				bd := DecodeBlock(mutated, customHeaderSize)
+				start := bd.pageStart(col)
+				require.Equal(t, byte(defaultBitmapEncoding), mutated[start])
+				off := align(start+1, align64) + uint64(m.word)<<align64Shift
+				binary.LittleEndian.PutUint64(mutated[off:], binary.LittleEndian.Uint64(mutated[off:])^(1<<m.bit))
+
+				func() {
+					defer func() {
+						r := recover()
+						err, _ := r.(error)
+						require.True(t, errors.HasAssertionFailure(err), "%v", r)
+					}()
+					bd.Bitmap(col)
+				}()
+				err := InitDataBlockMetadata(&testKeysSchema, &md, mutated)
+				require.True(t, base.IsCorruptionError(err), "%v", err)
+			})
+		}
 	}
 }

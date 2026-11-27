@@ -6,15 +6,19 @@ package colblk
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"math/rand/v2"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unicode"
 
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/binfmt"
 	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/stretchr/testify/require"
@@ -275,5 +279,251 @@ func BenchmarkBitmapBuilder(b *testing.B) {
 			}
 		}
 		_ = builder.Finish(0, size, 0, data)
+	}
+}
+
+// encodeTestBitmap encodes a bitmap of rows bits at offset 0 using a
+// BitmapBuilder. Each index in set is set (Finish excludes indexes ≥ rows)
+// before the optional Invert. It returns the encoding and the logical bits the
+// decoded bitmap must hold.
+func encodeTestBitmap(rows int, set []int, invert bool) (data []byte, want []bool) {
+	var bb BitmapBuilder
+	want = make([]bool, rows)
+	for _, i := range set {
+		bb.Set(i)
+		if i < rows {
+			want[i] = true
+		}
+	}
+	if invert {
+		bb.Invert(rows)
+		for i := range want {
+			want[i] = !want[i]
+		}
+	}
+	data = make([]byte, bb.Size(rows, 0))
+	if end := bb.Finish(0, rows, 0, data); int(end) != len(data) {
+		panic(fmt.Sprintf("Finish returned %d; Size returned %d", end, len(data)))
+	}
+	return data, want
+}
+
+// tryDecodeBitmap decodes a bitmap encoded at offset 0 of data, converting a
+// panic into an error.
+func tryDecodeBitmap(data []byte, bitCount uint32) (bm Bitmap, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			var ok bool
+			if err, ok = r.(error); !ok {
+				err = errors.Errorf("%v", r)
+			}
+		}
+	}()
+	bm, end := DecodeBitmap(data, 0, bitCount)
+	if end != uint64(len(data)) {
+		return bm, errors.Errorf("DecodeBitmap returned endOffset %d; encoding is %d bytes", end, len(data))
+	}
+	return bm, nil
+}
+
+func rowRange(start, end int) []int {
+	s := make([]int, 0, end-start)
+	for i := start; i < end; i++ {
+		s = append(s, i)
+	}
+	return s
+}
+
+// TestBitmapDecodeWriterRoundTrip verifies that DecodeBitmap accepts the
+// encodings BitmapBuilder produces. TestBitmapRandom covers the seek methods
+// over writer-produced bitmaps.
+func TestBitmapDecodeWriterRoundTrip(t *testing.T) {
+	sets := []struct {
+		name string
+		set  func(rows int) []int
+	}{
+		{"none", func(int) []int { return nil }},
+		// Inverted, every primary word is zero but the default encoding is used.
+		{"all", func(rows int) []int { return rowRange(0, rows) }},
+		// Only the first word is materialized; Finish zero-fills the rest.
+		{"first", func(int) []int { return []int{0} }},
+		// Every other word is zero, so the summary has unset bits.
+		{"alternate-words", func(rows int) []int {
+			var s []int
+			for i := 0; i < rows; i += 7 {
+				if (i>>6)%2 == 0 {
+					s = append(s, i)
+				}
+			}
+			return s
+		}},
+		// Finish with fewer rows than were set.
+		{"set-beyond-rows", func(rows int) []int { return rowRange(0, rows+130) }},
+		{"set-only-beyond-rows", func(rows int) []int { return rowRange(rows, rows+130) }},
+	}
+	// Partial and full last words, and both sides of the 64-word boundary of a
+	// summary word.
+	for _, rows := range []int{1, 63, 64, 65, 4096, 4097} {
+		for _, s := range sets {
+			for _, invert := range []bool{false, true} {
+				t.Run(fmt.Sprintf("rows=%d/%s/invert=%t", rows, s.name, invert), func(t *testing.T) {
+					data, want := encodeTestBitmap(rows, s.set(rows), invert)
+					bm, err := tryDecodeBitmap(data, uint32(rows))
+					require.NoError(t, err)
+					for i := range want {
+						if got := bm.At(i); got != want[i] {
+							t.Fatalf("At(%d) = %t; want %t", i, got, want[i])
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestBitmapDecodeRejectsMalformedEncoding verifies that DecodeBitmap rejects
+// well-sized encodings that violate the invariants the seek methods rely on.
+func TestBitmapDecodeRejectsMalformedEncoding(t *testing.T) {
+	// flip flips a bit of the idx'th word (primary words followed by summary
+	// words) of a default-encoded bitmap at offset 0.
+	flip := func(idx, bit int) func([]byte) {
+		return func(data []byte) {
+			off := align64 + idx<<align64Shift
+			binary.LittleEndian.PutUint64(data[off:], binary.LittleEndian.Uint64(data[off:])^(1<<bit))
+		}
+	}
+	testCases := []struct {
+		name   string
+		rows   int
+		set    []int
+		mutate func([]byte)
+	}{
+		{"unknown encoding", 65, []int{0}, func(data []byte) { data[0] = 2 }},
+		{"primary padding", 65, []int{0}, flip(1, 1)},
+		// A seek would read primary word 63 of a 2-word bitmap.
+		{"summary beyond last word", 65, []int{0}, flip(2, 63)},
+		// The second summary word of a 65-word bitmap summarizes one word.
+		{"second summary word beyond last word", 4097, []int{0}, flip(66, 1)},
+		{"stale summary set", 200, []int{0}, flip(4, 2)},
+		{"stale summary clear", 200, []int{0, 130}, flip(4, 2)},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, _ := encodeTestBitmap(tc.rows, tc.set, false /* invert */)
+			_, err := tryDecodeBitmap(data, uint32(tc.rows))
+			require.NoError(t, err)
+			tc.mutate(data)
+			_, err = tryDecodeBitmap(data, uint32(tc.rows))
+			require.True(t, errors.HasAssertionFailure(err), "%v", err)
+		})
+	}
+}
+
+// TestBitmapDecodeLargeBitCounts verifies the word arithmetic and decoding at
+// the limits of int without allocating large buffers.
+func TestBitmapDecodeLargeBitCounts(t *testing.T) {
+	require.Equal(t, 0, bitmapWords(0))
+	require.Equal(t, 1, bitmapWords(64))
+	require.Equal(t, 2, bitmapWords(65))
+	require.Equal(t, 1<<25, bitmapWords(math.MaxInt32))
+	require.Equal(t, math.MaxInt/64+1, bitmapWords(math.MaxInt))
+	require.Equal(t, (1<<25+1<<19)<<align64Shift, bitmapRequiredSize(math.MaxInt32))
+	start, end := Bitmap{bitCount: math.MaxInt32}.summaryTableBounds()
+	require.Equal(t, [2]int{1 << 25, 1<<25 + 1<<19}, [2]int{start, end})
+
+	// The zero encoding is one byte for any bit count that fits in an int.
+	zero := []byte{byte(zeroBitmapEncoding)}
+	bm, err := tryDecodeBitmap(zero, math.MaxInt32)
+	require.NoError(t, err)
+	require.Equal(t, math.MaxInt32, bm.SeekSetBitGE(0))
+	require.Equal(t, -1, bm.SeekSetBitLE(math.MaxInt32-1))
+	for _, bitCount := range []uint32{math.MaxInt32 + 1, math.MaxUint32} {
+		bm, err := tryDecodeBitmap(zero, bitCount)
+		if strconv.IntSize == 32 {
+			require.True(t, errors.HasAssertionFailure(err), "%v", err)
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, int(bitCount), bm.SeekSetBitGE(0))
+		}
+	}
+
+	// The default encoding of a large bit count is rejected by the size check.
+	small := make([]byte, 16)
+	small[0] = byte(defaultBitmapEncoding)
+	for _, bitCount := range []uint32{math.MaxInt32, math.MaxUint32} {
+		_, err := tryDecodeBitmap(small, bitCount)
+		require.True(t, errors.HasAssertionFailure(err), "%v", err)
+	}
+}
+
+// TestBitmapStringZeroEncodings verifies that the zero encoding, which has no
+// words, formats like a default-encoded bitmap whose words are all zero.
+func TestBitmapStringZeroEncodings(t *testing.T) {
+	const rows = 100
+	zeroData, _ := encodeTestBitmap(rows, nil, false /* invert */)
+	require.Equal(t, byte(zeroBitmapEncoding), zeroData[0])
+	// Inverting a fully set bitmap uses the default encoding with zero words.
+	defaultData, _ := encodeTestBitmap(rows, rowRange(0, rows), true /* invert */)
+	require.Equal(t, byte(defaultBitmapEncoding), defaultData[0])
+
+	zero, err := tryDecodeBitmap(zeroData, rows)
+	require.NoError(t, err)
+	def, err := tryDecodeBitmap(defaultData, rows)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("0", 128), zero.String())
+	require.Equal(t, def.String(), zero.String())
+}
+
+var bitmapBenchSink int
+
+// randomBits returns each index in [0, rows) with probability p.
+func randomBits(rng *rand.Rand, rows int, p float64) []int {
+	var s []int
+	for i := range rows {
+		if rng.Float64() < p {
+			s = append(s, i)
+		}
+	}
+	return s
+}
+
+// bitmapBenchDensities are the bit probabilities of the benchmarked bitmaps.
+// With p=0.01 about half of the primary words are zero.
+var bitmapBenchDensities = []struct {
+	name string
+	p    float64
+}{{"sparse", 0.01}, {"dense", 0.5}}
+
+func BenchmarkBitmapDecode(b *testing.B) {
+	for _, d := range bitmapBenchDensities {
+		for _, rows := range []int{64, 1024, 4096, 65536} {
+			rng := rand.New(rand.NewPCG(0, uint64(rows)))
+			data, _ := encodeTestBitmap(rows, randomBits(rng, rows, d.p), false /* invert */)
+			b.Run(fmt.Sprintf("%s/rows=%d", d.name, rows), func(b *testing.B) {
+				for range b.N {
+					bm, _ := DecodeBitmap(data, 0, uint32(rows))
+					bitmapBenchSink += bm.bitCount
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkBitmapSeek(b *testing.B) {
+	const rows = 4096
+	for _, d := range bitmapBenchDensities {
+		rng := rand.New(rand.NewPCG(0, rows))
+		data, _ := encodeTestBitmap(rows, randomBits(rng, rows, d.p), false /* invert */)
+		bm, _ := DecodeBitmap(data, 0, rows)
+		b.Run(fmt.Sprintf("%s/SeekSetBitGE", d.name), func(b *testing.B) {
+			for i := range b.N {
+				bitmapBenchSink += bm.SeekSetBitGE(i & (rows - 1))
+			}
+		})
+		b.Run(fmt.Sprintf("%s/SeekSetBitLE", d.name), func(b *testing.B) {
+			for i := range b.N {
+				bitmapBenchSink += bm.SeekSetBitLE(i & (rows - 1))
+			}
+		})
 	}
 }
