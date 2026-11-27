@@ -6,6 +6,7 @@ package cockroachkvs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/internal/treeprinter"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/cockroachdb/pebble/v2/sstable/colblk"
+	testify "github.com/stretchr/testify/require"
 )
 
 // TestKeySchema tests the cockroachKeyWriter and cockroachKeySeeker.
@@ -118,6 +120,38 @@ func runDataDrivenTest(t *testing.T, path string) {
 			return fmt.Sprintf("unknown command: %s", td.Cmd)
 		}
 	})
+}
+
+func TestMaterializeUserKeyBounds(t *testing.T) {
+	for _, version := range []string{"1,0", "1,1"} {
+		t.Run(version, func(t *testing.T) {
+			var enc colblk.DataBlockEncoder
+			enc.Init(&KeySchema)
+			key := parseUserKey("a @ " + version)
+			ikey := pebble.InternalKey{
+				UserKey: key,
+				Trailer: pebble.MakeInternalKeyTrailer(0, pebble.InternalKeyKindSet),
+			}
+			enc.Add(ikey, nil, block.InPlaceValuePrefix(false), enc.KeyWriter.ComparePrev(key), false)
+			data, _ := enc.Finish(enc.Rows(), enc.Size())
+			binary.LittleEndian.PutUint32(data[KeySchema.HeaderSize:], 0)
+
+			var dec colblk.DataBlockDecoder
+			dec.Init(&KeySchema, data)
+			var ks cockroachKeySeeker
+			ks.init(&dec)
+
+			backing := bytes.Repeat([]byte{0xa5}, 64)
+			var keyIter colblk.PrefixBytesIter
+			keyIter.Buf = backing[:0:2] // One key byte and the iterator's spare byte.
+			testify.Panics(t, func() { ks.MaterializeUserKey(&keyIter, -1, 0) })
+			for i, v := range backing[2:] {
+				if v != 0xa5 {
+					t.Fatalf("MVCC suffix wrote beyond key buffer at byte %d", i+2)
+				}
+			}
+		})
+	}
 }
 
 func TestKeySchema_RandomKeys(t *testing.T) {

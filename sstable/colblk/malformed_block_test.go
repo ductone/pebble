@@ -118,17 +118,32 @@ func TestMalformedKeyspanBoundaryIndex(t *testing.T) {
 	expectCorruptBlock(t, func() { d.Init(b) })
 }
 
-func TestMalformedDataBlockKeyLength(t *testing.T) {
+func TestDataBlockMaximumKeyLengthBound(t *testing.T) {
 	var w DataBlockEncoder
 	w.Init(&testKeysSchema)
-	k := base.ParseInternalKey("a#1,SET")
-	cmp := w.KeyWriter.ComparePrev(k.UserKey)
-	w.Add(k, []byte("v"), block.InPlaceValuePrefix(cmp.PrefixEqual()), cmp, false)
-	b, _ := w.Finish(w.Rows(), w.Size())
-	binary.LittleEndian.PutUint32(b[testKeysSchema.HeaderSize:], math.MaxUint32)
-	var md block.Metadata
-	if err := InitDataBlockMetadata(&testKeysSchema, &md, b); err == nil {
-		t.Fatal("corrupt key length was accepted before iterator allocation")
+	short := base.ParseInternalKey("a#1,SET")
+	cmp := w.KeyWriter.ComparePrev(short.UserKey)
+	w.Add(short, []byte("v"), block.InPlaceValuePrefix(cmp.PrefixEqual()), cmp, false)
+	size := w.Size()
+	long := base.ParseInternalKey(string(bytes.Repeat([]byte("z"), 4096)) + "#1,SET")
+	cmp = w.KeyWriter.ComparePrev(long.UserKey)
+	w.Add(long, []byte("v"), block.InPlaceValuePrefix(cmp.PrefixEqual()), cmp, false)
+	b, _ := w.Finish(w.Rows()-1, size)
+	if len(b) >= len(long.UserKey) {
+		t.Fatalf("expected a block shorter than its excluded key: %d >= %d", len(b), len(long.UserKey))
+	}
+	for _, recorded := range []uint32{uint32(len(long.UserKey)), math.MaxUint32} {
+		binary.LittleEndian.PutUint32(b[testKeysSchema.HeaderSize:], recorded)
+		var md block.Metadata
+		if err := InitDataBlockMetadata(&testKeysSchema, &md, b); err != nil {
+			t.Fatalf("recorded key length %d: %v", recorded, err)
+		}
+		var d DataBlockDecoder
+		d.Init(&testKeysSchema, b)
+		if d.maximumKeyLength != uint32(len(b)) {
+			t.Fatalf("recorded key length %d: bounded length = %d, want %d",
+				recorded, d.maximumKeyLength, len(b))
+		}
 	}
 }
 

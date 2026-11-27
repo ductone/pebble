@@ -969,7 +969,6 @@ func (ks *cockroachKeySeeker) MaterializeUserKey(
 	}
 
 	roachKeyLen := len(ki.Buf)
-	ptr := unsafe.Pointer(uintptr(unsafe.Pointer(unsafe.SliceData(ki.Buf))) + uintptr(roachKeyLen))
 	mvccWall := ks.mvccWallTimes.At(row)
 	mvccLogical := uint32(ks.mvccLogical.At(row))
 	if mvccWall == 0 && mvccLogical == 0 {
@@ -982,6 +981,7 @@ func (ks *cockroachKeySeeker) MaterializeUserKey(
 		}
 		// Slice first, to check that the capacity is sufficient.
 		res := ki.Buf[:roachKeyLen+2+len(untypedVersion)]
+		ptr := unsafe.Pointer(uintptr(unsafe.Pointer(unsafe.SliceData(ki.Buf))) + uintptr(roachKeyLen))
 		*(*byte)(ptr) = 0
 		memmove(
 			unsafe.Add(ptr, 1),
@@ -991,6 +991,14 @@ func (ks *cockroachKeySeeker) MaterializeUserKey(
 		*(*byte)(unsafe.Add(ptr, len(untypedVersion)+1)) = byte(len(untypedVersion) + 1)
 		return res
 	}
+
+	// Slice first, to check that the capacity is sufficient.
+	keyLen := roachKeyLen + 10
+	if mvccLogical != 0 {
+		keyLen += 4
+	}
+	res := ki.Buf[:keyLen]
+	ptr := unsafe.Pointer(uintptr(unsafe.Pointer(unsafe.SliceData(ki.Buf))) + uintptr(roachKeyLen))
 
 	// Inline binary.BigEndian.PutUint64. Note that this code is converted into
 	// word-size instructions by the compiler.
@@ -1008,7 +1016,7 @@ func (ks *cockroachKeySeeker) MaterializeUserKey(
 	// This is an MVCC key.
 	if mvccLogical == 0 {
 		*(*byte)(ptr) = 9
-		return ki.Buf[:len(ki.Buf)+10]
+		return res
 	}
 
 	// Inline binary.BigEndian.PutUint32.
@@ -1017,7 +1025,7 @@ func (ks *cockroachKeySeeker) MaterializeUserKey(
 	*(*byte)(unsafe.Add(ptr, 2)) = byte(mvccLogical >> 8)
 	*(*byte)(unsafe.Add(ptr, 3)) = byte(mvccLogical)
 	*(*byte)(unsafe.Add(ptr, 4)) = 13
-	return ki.Buf[:len(ki.Buf)+14]
+	return res
 }
 
 // MaterializeUserKeyWithSyntheticSuffix is part of the KeySeeker interface.
