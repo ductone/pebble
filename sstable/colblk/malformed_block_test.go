@@ -139,8 +139,8 @@ func TestDataBlockMaximumKeyLengthBound(t *testing.T) {
 		t.Fatalf("expected a block shorter than its excluded key: %d >= %d", len(data), len(long.UserKey))
 	}
 	recorded := binary.LittleEndian.Uint32(data[testKeysSchema.HeaderSize:])
-	if recorded <= uint32(len(data)) {
-		t.Fatalf("writer recorded key length %d within block size %d", recorded, len(data))
+	if recorded != uint32(len(long.UserKey)) {
+		t.Fatalf("writer recorded key length %d, want %d", recorded, len(long.UserKey))
 	}
 	for _, keyLen := range []uint32{recorded, math.MaxUint32} {
 		binary.LittleEndian.PutUint32(data[testKeysSchema.HeaderSize:], keyLen)
@@ -149,10 +149,28 @@ func TestDataBlockMaximumKeyLengthBound(t *testing.T) {
 			t.Fatalf("recorded key length %d: %v", keyLen, err)
 		}
 		var d DataBlockDecoder
-		d.Init(&testKeysSchema, data)
+		bd := d.Init(&testKeysSchema, data)
 		if d.maximumKeyLength != uint32(len(data)) {
 			t.Fatalf("recorded key length %d: bounded length = %d, want %d",
 				keyLen, d.maximumKeyLength, len(data))
+		}
+		var iter DataBlockIter
+		iter.InitOnce(&testKeysSchema, testkeys.Comparer, nil, NoTieringColumns())
+		if err := iter.Init(&d, bd, blockiter.Transforms{}, NoTieringColumns()); err != nil {
+			t.Fatal(err)
+		}
+		if cap(iter.keyIter.Buf) > len(data)+1 {
+			t.Fatalf("key buffer capacity %d exceeds block size %d", cap(iter.keyIter.Buf), len(data))
+		}
+		if kv := iter.First(); kv == nil || !bytes.Equal(kv.K.UserKey, short.UserKey) {
+			t.Fatal("first key was not materialized from the block")
+		}
+		if iter.Next() != nil {
+			t.Fatal("excluded key appeared in the block")
+		}
+		var validator DataBlockValidator
+		if err := validator.Validate(data, testkeys.Comparer, &testKeysSchema); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
