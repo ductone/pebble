@@ -166,10 +166,15 @@ type indexBlockDecoder struct {
 // block.
 func (d *indexBlockDecoder) Init(data []byte) {
 	d.virtualBlockCount = int(binary.LittleEndian.Uint32(data))
+	if d.virtualBlockCount < 0 {
+		// Only possible where int is 32 bits.
+		panic(errors.AssertionFailedf("invalid virtual block count"))
+	}
 	d.bd.Init(data, indexBlockCustomHeaderSize)
 	d.virtualBlocks = colblk.DecodeColumn(&d.bd, indexBlockColumnVirtualBlocksIdx,
 		uint32(d.virtualBlockCount), colblk.DataTypeUint, colblk.DecodeUnsafeUints)
-	if uint32(d.bd.Rows()) == math.MaxUint32 {
+	// A negative row count is only possible where int is 32 bits.
+	if d.bd.Rows() < 0 || uint32(d.bd.Rows()) == math.MaxUint32 {
 		panic(errors.AssertionFailedf("invalid row count"))
 	}
 	// Decode the offsets column. We pass rows+1 because an index block encoding
@@ -202,17 +207,17 @@ func (d *indexBlockDecoder) BlockHandle(blockIndex int) (block.Handle, error) {
 
 // virtualBlockMapping returns the decoded virtualBlocks entry for the virtual
 // block ID i. If gap is true, the virtual block has no live values and
-// blockIndex and valueIDOffset are meaningless.
+// blockIndex and valueIDOffset are meaningless. blockIndex is not validated.
 //
 // REQUIRES: 0 <= i < d.virtualBlockCount
 func (d *indexBlockDecoder) virtualBlockMapping(
 	i int,
-) (blockIndex int, valueIDOffset BlockValueID, gap bool) {
+) (blockIndex uint64, valueIDOffset BlockValueID, gap bool) {
 	v := d.virtualBlocks.At(i)
 	if v&virtualBlockIndexMask == virtualBlockIndexMask {
 		return 0, 0, true
 	}
-	return int(v & virtualBlockIndexMask), BlockValueID(v >> 32), false
+	return v & virtualBlockIndexMask, BlockValueID(v >> 32), false
 }
 
 // RemapVirtualBlockID remaps a virtual block ID to a physical block index and a
@@ -222,24 +227,49 @@ func (d *indexBlockDecoder) virtualBlockMapping(
 // virtual block with no live values), or maps to an out-of-range physical
 // block index.
 //
+// The returned endRow is an exclusive upper bound on the physical row index of
+// the virtual block's values. A rewritten file records the mappings in
+// ascending virtual block ID order, each with the physical block's value count
+// at the time the virtual block began, so the virtual block's values end where
+// the next non-gap virtual block begins if that virtual block is in the same
+// physical block. Otherwise the virtual block extends to the end of its
+// physical block and endRow is math.MaxUint64.
+//
 // REQUIRES: d.virtualBlockCount > 0
 func (d *indexBlockDecoder) RemapVirtualBlockID(
 	blockID BlockID,
-) (blockIndex int, valueIDOffset BlockValueID, err error) {
+) (blockIndex int, valueIDOffset BlockValueID, endRow uint64, err error) {
 	if uint64(blockID) >= uint64(d.virtualBlockCount) {
-		return 0, 0, base.CorruptionErrorf("blob: virtual block ID %d out of range [0, %d)",
+		return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d out of range [0, %d)",
 			errors.Safe(blockID), errors.Safe(d.virtualBlockCount))
 	}
-	blockIndex, valueIDOffset, gap := d.virtualBlockMapping(int(blockID))
+	physicalIndex, valueIDOffset, gap := d.virtualBlockMapping(int(blockID))
 	if gap {
-		return 0, 0, errors.AssertionFailedf("blob: virtual block ID %d should be unreferenced",
+		return 0, 0, 0, errors.AssertionFailedf("blob: virtual block ID %d should be unreferenced",
 			errors.Safe(blockID))
 	}
-	if blockIndex >= d.bd.Rows() {
-		return 0, 0, base.CorruptionErrorf("blob: virtual block ID %d maps to physical block index %d out of range [0, %d)",
-			errors.Safe(blockID), errors.Safe(blockIndex), errors.Safe(d.bd.Rows()))
+	if physicalIndex >= uint64(d.bd.Rows()) {
+		return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d maps to physical block index %d out of range [0, %d)",
+			errors.Safe(blockID), errors.Safe(physicalIndex), errors.Safe(d.bd.Rows()))
 	}
-	return blockIndex, valueIDOffset, nil
+	endRow = math.MaxUint64
+	for i := int(blockID) + 1; i < d.virtualBlockCount; i++ {
+		nextPhysicalIndex, nextValueIDOffset, nextGap := d.virtualBlockMapping(i)
+		if nextGap {
+			continue
+		}
+		if nextPhysicalIndex == physicalIndex {
+			if nextValueIDOffset < valueIDOffset {
+				return 0, 0, 0, base.CorruptionErrorf("blob: virtual block ID %d has valueID offset %d, preceding offset %d of virtual block ID %d in physical block %d",
+					errors.Safe(i), errors.Safe(nextValueIDOffset), errors.Safe(valueIDOffset),
+					errors.Safe(blockID), errors.Safe(physicalIndex))
+			}
+			endRow = uint64(nextValueIDOffset)
+		}
+		break
+	}
+	// physicalIndex < d.bd.Rows(), so it is representable as an int.
+	return int(physicalIndex), valueIDOffset, endRow, nil
 }
 
 // BlockCount returns the number of physical blocks encoded in the index block.
@@ -361,6 +391,10 @@ type blobValueBlockDecoder struct {
 // Init initializes the decoder with the given serialized blob value block.
 func (d *blobValueBlockDecoder) Init(data []byte) {
 	d.bd.Init(data, blobValueBlockCustomHeaderSize)
+	if d.bd.Rows() < 0 {
+		// Only possible where int is 32 bits.
+		panic(errors.AssertionFailedf("invalid row count"))
+	}
 	d.values = d.bd.RawBytes(blobValueBlockColumnValuesIdx)
 }
 

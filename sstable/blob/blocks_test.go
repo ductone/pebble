@@ -7,6 +7,7 @@ package blob
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -82,12 +83,16 @@ func TestIndexBlockEncoding(t *testing.T) {
 			for _, arg := range d.CmdArgs {
 				blockID, err := strconv.ParseInt(arg.Key, 10, 64)
 				require.NoError(t, err)
-				blockIndex, valueIDOffset, err := decoder.RemapVirtualBlockID(BlockID(blockID))
+				blockIndex, valueIDOffset, endRow, err := decoder.RemapVirtualBlockID(BlockID(blockID))
 				if err != nil {
 					fmt.Fprintf(&buf, "%d -> error: %s\n", blockID, err)
 					continue
 				}
-				fmt.Fprintf(&buf, "%d -> block %d, with valueID offset %d\n", blockID, blockIndex, valueIDOffset)
+				fmt.Fprintf(&buf, "%d -> block %d, with valueID offset %d", blockID, blockIndex, valueIDOffset)
+				if endRow != math.MaxUint64 {
+					fmt.Fprintf(&buf, ", end row %d", endRow)
+				}
+				fmt.Fprintln(&buf)
 			}
 			return buf.String()
 

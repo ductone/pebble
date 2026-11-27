@@ -144,6 +144,16 @@ func testRewrittenFileGap(t *testing.T, cacheSize int64) {
 		}{{0, 0}, {0, 0}, {0, 2}, {2, 1}, {2, 3}, {0, 2}, {2, 3}, {3, 0}, {3, 0}, {2, 1}, {0, 0}} {
 			expectValue(t, f, h.b, h.v)
 		}
+		// Value IDs skipped by the rewrite within a live virtual block's
+		// range are empty placeholders, not errors.
+		for _, h := range []struct {
+			b BlockID
+			v BlockValueID
+		}{{0, 1}, {2, 0}, {2, 2}} {
+			v, err := fetch(f, h.b, h.v)
+			require.NoError(t, err, "fetch(%d, %d)", h.b, h.v)
+			require.Empty(t, v, "fetch(%d, %d)", h.b, h.v)
+		}
 	})
 
 	isCorruption := func(err error) bool { return errors.Is(err, base.ErrCorruption) }
@@ -166,7 +176,11 @@ func testRewrittenFileGap(t *testing.T, cacheSize int64) {
 			errCase{"gap", rewrittenFileNum, 1, 0, wc, isGap},
 			errCase{"virtual-block-out-of-range", rewrittenFileNum, 4, 0, wc, isCorruption},
 			errCase{"virtual-block-max", rewrittenFileNum, math.MaxUint32, 0, wc, isCorruption},
-			// Physical block 0 holds 7 rows; virtual block 2 starts at row 3.
+			// Physical block 0 holds 7 rows; virtual block 2 starts at row 3,
+			// so virtual block 0 holds rows [0, 3). Value IDs 3 and 4 of
+			// virtual block 0 would resolve to virtual block 2's rows.
+			errCase{"value-at-next-virtual-block", rewrittenFileNum, 0, 3, wc, isCorruption},
+			errCase{"value-bleeds-into-next-virtual-block", rewrittenFileNum, 0, 4, wc, isCorruption},
 			errCase{"value-past-block", rewrittenFileNum, 2, 4, wc, isCorruption},
 			// MaxUint32-2 + 3 wraps to 0 in 32 bits.
 			errCase{"value-wraps-32-bits", rewrittenFileNum, 2, math.MaxUint32 - 2, wc, isCorruption},
