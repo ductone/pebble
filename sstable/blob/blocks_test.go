@@ -7,12 +7,15 @@ package blob
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/stretchr/testify/require"
 )
@@ -67,7 +70,11 @@ func TestIndexBlockEncoding(t *testing.T) {
 			for _, arg := range d.CmdArgs {
 				blockIndex, err := strconv.Atoi(arg.Key)
 				require.NoError(t, err)
-				h := decoder.BlockHandle(blockIndex)
+				h, err := decoder.BlockHandle(blockIndex)
+				if err != nil {
+					fmt.Fprintf(&buf, "%d: error: %s\n", blockIndex, err)
+					continue
+				}
 				fmt.Fprintf(&buf, "%d: %s\n", blockIndex, h)
 			}
 			return buf.String()
@@ -76,8 +83,16 @@ func TestIndexBlockEncoding(t *testing.T) {
 			for _, arg := range d.CmdArgs {
 				blockID, err := strconv.ParseInt(arg.Key, 10, 64)
 				require.NoError(t, err)
-				blockIndex, valueIDOffset := decoder.RemapVirtualBlockID(BlockID(blockID))
-				fmt.Fprintf(&buf, "%d -> block %d, with valueID offset %d\n", blockID, blockIndex, valueIDOffset)
+				blockIndex, valueIDOffset, endRow, err := decoder.RemapVirtualBlockID(BlockID(blockID))
+				if err != nil {
+					fmt.Fprintf(&buf, "%d -> error: %s\n", blockID, err)
+					continue
+				}
+				fmt.Fprintf(&buf, "%d -> block %d, with valueID offset %d", blockID, blockIndex, valueIDOffset)
+				if endRow != math.MaxUint64 {
+					fmt.Fprintf(&buf, ", end row %d", endRow)
+				}
+				fmt.Fprintln(&buf)
 			}
 			return buf.String()
 
@@ -86,4 +101,30 @@ func TestIndexBlockEncoding(t *testing.T) {
 			return ""
 		}
 	})
+}
+
+func TestIndexBlockDecoderMalformedOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		offsets []uint64
+	}{
+		{name: "decreasing", offsets: []uint64{10, 35, 20}},
+		{name: "shorter-than-trailer", offsets: []uint64{10, 35, 35 + block.TrailerLen - 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var e indexBlockEncoder
+			e.Init()
+			for i, off := range tc.offsets {
+				e.offsets.Set(i, off)
+			}
+			e.countBlocks = len(tc.offsets) - 1
+			var d indexBlockDecoder
+			d.Init(e.Finish())
+			h, err := d.BlockHandle(0)
+			require.NoError(t, err)
+			require.Equal(t, block.Handle{Offset: 10, Length: 20}, h)
+			_, err = d.BlockHandle(1)
+			require.True(t, errors.Is(err, base.ErrCorruption), "unexpected error: %v", err)
+		})
+	}
 }
