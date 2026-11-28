@@ -230,10 +230,24 @@ type KeyspanDecoder struct {
 	values   RawBytes
 }
 
-// Init initializes the keyspan decoder with the given block data.
+// Init initializes the keyspan decoder with the given block data. Init panics
+// if the block is malformed; InitKeyspanBlockMetadata converts the panic into a
+// corruption error.
 func (d *KeyspanDecoder) Init(data []byte) {
 	d.boundaryKeysCount = binary.LittleEndian.Uint32(data[:4])
 	d.blockDecoder.Init(data, keyspanHeaderSize)
+	// Column decoders and iterators convert both counts to int, which may be
+	// 32 bits.
+	if rows := d.blockDecoder.header.Rows; int(d.boundaryKeysCount) < 0 || int(rows) < 0 {
+		panic(base.CorruptionErrorf("keyspan block counts overflow int: %d boundary keys, %d keys",
+			errors.Safe(d.boundaryKeysCount), errors.Safe(rows)))
+	}
+	// Column decoding chains each column's end to the next column's start, and
+	// the last to the block's padding byte only if no further columns follow.
+	if cols := d.blockDecoder.header.Columns; cols != keyspanColumnCount {
+		panic(base.CorruptionErrorf("keyspan block has %d columns; expected %d",
+			errors.Safe(cols), errors.Safe(keyspanColumnCount)))
+	}
 	// The boundary key columns have a different number of rows than the other
 	// columns, so we call DecodeColumn directly, taking care to pass in
 	// rows=r.boundaryKeysCount.
@@ -245,6 +259,42 @@ func (d *KeyspanDecoder) Init(data []byte) {
 	d.trailers = d.blockDecoder.Uints(keyspanColTrailers)
 	d.suffixes = d.blockDecoder.RawBytes(keyspanColSuffixes)
 	d.values = d.blockDecoder.RawBytes(keyspanColValues)
+	d.validateBoundaryKeyIndices()
+}
+
+// validateBoundaryKeyIndices checks the boundary key indices, which are
+// counted by the keyspan header rather than the block header's Rows, before
+// keyspanIter uses each pair [indices[i], indices[i+1]) as unchecked rows of
+// the key columns. KeyspanBlockWriter writes 0 first, the key count last, and
+// never decreases an index (an empty span repeats the previous index); it
+// writes no keys without boundaries, which would otherwise go unread.
+func (d *KeyspanDecoder) validateBoundaryKeyIndices() {
+	rows := d.blockDecoder.header.Rows
+	n := int(d.boundaryKeysCount)
+	if n == 0 {
+		if rows != 0 {
+			panic(base.CorruptionErrorf("keyspan block has %d keys but no boundary keys", errors.Safe(rows)))
+		}
+		return
+	}
+	if first, last := d.boundaryKeyIndices.At(0), d.boundaryKeyIndices.At(n-1); first != 0 || last != uint64(rows) {
+		panic(base.CorruptionErrorf("keyspan block boundary key indices span [%d, %d]; expected [0, %d]",
+			errors.Safe(first), errors.Safe(last), errors.Safe(rows)))
+	}
+	// A zero-width column is a constant: O(1) regardless of its logical count.
+	// Otherwise its n*width bytes lie within the block, bounding this scan.
+	if d.boundaryKeyIndices.width == 0 {
+		return
+	}
+	prev := uint64(0)
+	for i := 1; i < n; i++ {
+		idx := d.boundaryKeyIndices.At(i)
+		if idx < prev {
+			panic(base.CorruptionErrorf("keyspan block boundary key index %d decreases: %d < %d",
+				errors.Safe(i), errors.Safe(idx), errors.Safe(prev)))
+		}
+		prev = idx
+	}
 }
 
 // DebugString prints a human-readable explanation of the keyspan block's binary
