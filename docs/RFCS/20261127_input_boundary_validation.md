@@ -218,11 +218,14 @@ slowdown may warrant a separate optimization without weakening the bounds
 proof or adding an arbitrary size cap.
 
 The fork's [RawBytes offsets PR #9](https://github.com/ductone/pebble/pull/9)
-measured metadata initialization at 123 ns before versus 4.84 µs after
-for a 3,400-row block; warm iteration was within noise. That cold cost is
-material, not a reason to leave unchecked offsets: compare an integrated
-read/checksum/decompress/init miss and the specialized scan against a plain
-loop before claiming the trade-off upstream.
+measured metadata initialization at 122 ns before versus 4.84 µs after
+for a 3,400-row block; warm iteration was within noise. On an in-memory
+copy/checksum/decompress/init/seek miss, the same block changed from 7.32 to
+12.40 µs with MinLZ and 10.61 to 15.31 µs with Snappy on arm64. A
+237-row miss was within decompression noise. This is a material dense-block
+CPU trade-off, not a reason to leave unchecked offsets or assume I/O hides it.
+The specialized scan measured 0.46 ns/offset versus 0.64 for a plain loop;
+keep the fast path measurable rather than promising universal neutrality.
 
 # Proposed upstream PR stack
 
@@ -333,29 +336,38 @@ remain the columnar foundation.
    zero/dense/sparse bitmaps at 63/64/65 bits, corrupt tail-summary and
    padding bits, and forward/reverse seeks.
 7. **Keyspan boundary indexes (after PRs 2–3).**
-   `KeyspanDecoder.Init` decodes separately counted boundary indices;
-   `keyspanIter.materializeSpan` uses them to index trailers, suffixes and
-   values. Prove nondecreasing indexes within key-row count before
-   exposing the iterator; equal indexes are valid gaps. Check width-zero
-   constants once, not once per logical row. Test writer gapped/empty
-   spans, decreasing and past-end indexes across
-   `First/Last/SeekGE/SeekLT/Next/Prev`; retain
-   `BenchmarkKeyspanBlock_RangeDeletions` and measure cold validation if it
-   scans positive-width entries.
-8. **Direct and nested error boundaries (after PRs 2–3, by caller).**
+   [Fork PR #11](https://github.com/ductone/pebble/pull/11) checks the
+   logical indexes and five-column schema after decoding the columns.
+   `keyspanIter.materializeSpan` uses boundary indexes to access trailers,
+   suffixes and values; nondecreasing indexes within the key-row count
+   permit equal-index gaps. Width-zero constants take O(1) validation.
+   The PR is independently reviewable but not a complete malformed-block
+   safety proof on master: physical page reads and RawBytes intermediate
+   offsets still depend on PRs 2–3. A 1,000-span init measured 50.49 ns
+   before versus 1.968 µs after; warm keyspan seeks stayed near baseline.
+   Test the combined #7+#9+#11 tree and retain writer gapped/empty spans,
+   bad indexes and `First/Last/SeekGE/SeekLT/Next/Prev` coverage.
+8. **Direct and nested error boundaries (dependent on PR 3).**
    `ReferenceLivenessBlockDecoder.Init` executes after a no-op cache
    metadata initializer in ingest, blob rewrite, level checking and layout.
-   Confirm each call's recovery/error contract, check `refID < Rows()` in
-   blob rewrite before `LivenessAtReference`, and make
-   `DecodeBlobRefLivenessEncoding` validate its bitmap size before a Go
-   slice that currently panics despite the function's error return.
-   A separate reader-open PR may wrap `decodePropertiesBlock` and
-   columnar metaindex direct initialization if a malformed fixture
-   proves an escaping assertion. Test each actual public call site with
-   writer-produced positives, truncated outer/inner bytes, no partial
-   state and contextual errors. The histogram describer is another
-   *conditional* caller, not part of the liveness PR by default; avoid
-   claiming a new unsafe read in the bitmap's Go slice itself.
+   Its own minimum-size check and PR #9's RawBytes offsets proof must
+   precede any claim that an inflated row count or decreasing offset cannot
+   cause an unchecked read; PR #7 adds generic page confinement. Stack the
+   liveness PR on #9, test writer-built blocks with an inflated row count
+   and intermediate offset inversion both directly and through ingest/rewrite,
+   and verify the combined #7+#9+liveness tree before a C1 port.
+   Check `refID < Rows()` before `LivenessAtReference` and validate bitmap
+   size before slicing. On 386 a writer-valid final bit at `MaxInt32` uses
+   `MaxInt32+1` as the exclusive bit count: keep cursor arithmetic widened
+   and narrow only a proven yielded index. Ingest must close remaining
+   readables when a nested record fails, with table/ref context.
+   Bitmap validation may be O(encoded bytes) while iteration over encoded
+   set bits remains proportional to those claimed bits; a separate resource
+   policy must not be smuggled into this stack. A separate reader-open PR
+   may wrap `decodePropertiesBlock` and columnar metaindex direct
+   initialization if a malformed fixture proves an escaping assertion.
+   The histogram describer is another conditional caller, not part of the
+   liveness PR by default.
 
 Seed constructor fuzz targets with writer-produced blocks and mutated
 counts, shifts, offsets and truncated varints in their owning PRs once
