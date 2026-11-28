@@ -370,7 +370,9 @@ func (l *Layout) Describe(
 					return err
 				}
 				var decoder colblk.ReferenceLivenessBlockDecoder
-				decoder.Init(h.BlockData())
+				if err := decoder.InitChecked(h.BlockData()); err != nil {
+					return errors.Wrap(err, "blob reference index")
+				}
 				offset := 0
 				for i := range decoder.BlockDecoder().Rows() {
 					value := decoder.LivenessAtReference(i)

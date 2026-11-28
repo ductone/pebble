@@ -537,7 +537,10 @@ func constructBlobFileMetadataForIngestedTable(
 	}
 	defer h.Release()
 	var decoder colblk.ReferenceLivenessBlockDecoder
-	decoder.Init(h.BlockData())
+	if err := decoder.InitChecked(h.BlockData()); err != nil {
+		_ = closeReadables(blobFiles)
+		return nil, errors.Wrapf(err, "pebble: ingested table %s blob reference index", tableMeta.TableNum)
+	}
 	if decoder.BlockDecoder().Rows() != len(blobFiles) {
 		_ = closeReadables(blobFiles)
 		return nil, errors.Newf("pebble: blob reference index has %d entries, but %d blob files were provided",
@@ -556,7 +559,11 @@ func constructBlobFileMetadataForIngestedTable(
 		var valueSize uint64
 		blocks, err := sstable.DecodeBlobRefLivenessEncoding(blockEncodings)
 		if err != nil {
-			return nil, err
+			// Blob files before i were closed by earlier iterations; close the
+			// rest, as promised to the caller.
+			err = errors.Wrapf(err, "pebble: ingested table %s blob reference %d (blob file %s)",
+				tableMeta.TableNum, i, blobFileNums[i])
+			return nil, errors.CombineErrors(err, closeReadables(blobFiles[i:]))
 		}
 		for _, enc := range blocks {
 			// There should be only one encoding per blob file.

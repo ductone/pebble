@@ -7,7 +7,10 @@ package sstable
 import (
 	"encoding/binary"
 	"iter"
+	"math"
+	"math/bits"
 
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 )
 
@@ -159,14 +162,74 @@ func (bb *BitmapRunLengthEncoder) Size() int {
 	}
 }
 
+// maxRunLengthBitmapBits bounds the number of bits a run-length encoded
+// liveness bitmap may describe. It is one past the largest bit index that is
+// both a blob.BlockValueID (uint32) and an int, the type that
+// BitmapRunLengthEncoder.Set accepts and IterSetBitsInRunLengthBitmap yields,
+// so every bit index within the bound is representable as both.
+const maxRunLengthBitmapBits = min(uint64(math.MaxInt)+1, uint64(math.MaxUint32)+1)
+
+// advanceRunLengthBitmap returns the bit count after appending n bytes' worth
+// of bits to a bitmap describing count bits. It returns false, without
+// overflowing, if the result would exceed maxRunLengthBitmapBits.
+func advanceRunLengthBitmap(count, n uint64) (uint64, bool) {
+	if count > maxRunLengthBitmapBits || n > (maxRunLengthBitmapBits-count)/8 {
+		return count, false
+	}
+	return count + 8*n, true
+}
+
+// validateRunLengthBitmap checks that bitmap is a well-formed run-length
+// encoded bitmap: every run length decodes as a varint, and the bitmap
+// describes at most maxRunLengthBitmapBits bits. It runs in time linear in
+// len(bitmap) and does not depend on the run lengths it decodes.
+func validateRunLengthBitmap(bitmap []byte) error {
+	var count uint64
+	var ok bool
+	for i := 0; i < len(bitmap); {
+		var n uint64
+		if b := bitmap[i]; b == 0x00 || b == 0xFF {
+			v, w := binary.Uvarint(bitmap[i+1:])
+			if w <= 0 {
+				return base.CorruptionErrorf("run-length bitmap has a malformed run length at offset %d", i+1)
+			}
+			i += 1 + w
+			n = v
+		} else {
+			// Count the run of literal bytes, each describing 8 bits.
+			j := i + 1
+			for j < len(bitmap) && bitmap[j] != 0x00 && bitmap[j] != 0xFF {
+				j++
+			}
+			n = uint64(j - i)
+			i = j
+		}
+		if count, ok = advanceRunLengthBitmap(count, n); !ok {
+			return base.CorruptionErrorf("run-length bitmap describes more than %d bits", maxRunLengthBitmapBits)
+		}
+	}
+	return nil
+}
+
 // IterSetBitsInRunLengthBitmap returns an iterator over the indices of set bits
-// within the provided run-length encoded bitmap.
+// within the provided run-length encoded bitmap. The bitmap should have been
+// checked by validateRunLengthBitmap (DecodeBlobRefLivenessEncoding does so);
+// iteration stops early at a malformed run length or at a run extending beyond
+// maxRunLengthBitmapBits, so every yielded index fits in an int and a uint32.
+//
+// Runs of unset bits are skipped in constant time, but every set bit is
+// yielded. A run of set bits encoded in a few bytes can therefore yield up to
+// maxRunLengthBitmapBits indices, and callers that collect them use time and
+// memory proportional to the number of set bits the bitmap claims, not to its
+// encoded size.
 func IterSetBitsInRunLengthBitmap(bitmap []byte) iter.Seq[int] {
 	return func(yield func(int) bool) {
 		// i is the index of the current byte in the bitmap.
 		i := 0
-		// bit is the index of the current bit in the overall bitmap.
-		bit := 0
+		// bit is the index of the current bit in the overall bitmap. It is
+		// kept as a uint64 because a bitmap may end at maxRunLengthBitmapBits,
+		// which can exceed math.MaxInt.
+		var bit uint64
 		for i < len(bitmap) {
 			b := bitmap[i]
 			i++
@@ -175,31 +238,44 @@ func IterSetBitsInRunLengthBitmap(bitmap []byte) iter.Seq[int] {
 				// Decode the varint. A decoded value of v indicates that there
 				// are 8*v consecutive unset bits in the bitmap.
 				v, n := binary.Uvarint(bitmap[i:])
+				if n <= 0 {
+					return
+				}
 				i += n
-				bit += 8 * int(v)
+				var ok bool
+				if bit, ok = advanceRunLengthBitmap(bit, v); !ok {
+					return
+				}
 			case 0xFF:
 				// Decode the varint. A decoded value of v indicates that there
 				// are 8*v consecutive set bits in the bitmap.
 				v, n := binary.Uvarint(bitmap[i:])
+				if n <= 0 {
+					return
+				}
 				i += n
-				for j := range 8 * int(v) {
-					if !yield(bit + j) {
+				end, ok := advanceRunLengthBitmap(bit, v)
+				if !ok {
+					return
+				}
+				for ; bit < end; bit++ {
+					if !yield(int(bit)) {
 						return
 					}
 				}
-				bit += 8 * int(v)
 			default:
-				// b is a byte that is neither all ones nor all zeros. Check
-				// each bit and yield the index of any set bits to the iterator.
-				for j := range 8 {
-					if b&(1<<j) == 0 {
-						continue
-					}
-					if !yield(bit + j) {
+				// b is a byte that is neither all ones nor all zeros. Yield the
+				// index of each set bit, in increasing order.
+				end, ok := advanceRunLengthBitmap(bit, 1)
+				if !ok {
+					return
+				}
+				for x := b; x != 0; x &= x - 1 {
+					if !yield(int(bit + uint64(bits.TrailingZeros8(x)))) {
 						return
 					}
 				}
-				bit += 8
+				bit = end
 			}
 		}
 	}

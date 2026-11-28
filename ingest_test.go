@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/blobtest"
+	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangekey"
@@ -41,6 +42,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/tablefilters/bloom"
@@ -3946,4 +3948,136 @@ func (a *testFileNumAllocator) nextFileNum() base.DiskFileNum {
 	n := a.fileNums[a.idx]
 	a.idx++
 	return n
+}
+
+// closeCountingReadable counts calls to Close.
+type closeCountingReadable struct {
+	objstorage.Readable
+	closes *int
+}
+
+func (r closeCountingReadable) Close() error {
+	*r.closes++
+	return r.Readable.Close()
+}
+
+// TestIngestBlobRefLivenessDecodeError checks that a malformed blob reference
+// liveness encoding fails ingestion with a corruption error naming the table,
+// reference and blob file, and that every blob file is still closed exactly
+// once.
+func TestIngestBlobRefLivenessDecodeError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	blobFileNums := []base.DiskFileNum{10, 11}
+	const tableFileNum = base.DiskFileNum(12)
+	ctx := context.Background()
+
+	run := func(t *testing.T, mutate func(livenessBlock []byte)) (closes []int, err error) {
+		fs := vfs.NewMem()
+		var st objstorageprovider.Settings
+		st.Local.FS = fs
+		objStore, err := objstorageprovider.Open(st)
+		require.NoError(t, err)
+		defer objStore.Close()
+
+		// Write one value to each blob file, and a table referencing blob file
+		// i as reference ID i.
+		w, _, err := objStore.Create(ctx, base.FileTypeTable, tableFileNum, objstorage.CreateOptions{})
+		require.NoError(t, err)
+		tw := sstable.NewRawWriter(w, sstable.WriterOptions{
+			TableFormat: sstable.TableFormatMax,
+			Checksum:    block.ChecksumTypeCRC32c,
+		})
+		for i, fileNum := range blobFileNums {
+			value := []byte(fmt.Sprintf("blob-value-%d", i))
+			bw, _, err := objStore.Create(ctx, base.FileTypeBlob, fileNum, objstorage.CreateOptions{})
+			require.NoError(t, err)
+			blobWriter := blob.NewFileWriter(fileNum, bw, blob.FileWriterOptions{})
+			handle := blobWriter.AddValue(value, false /* isLikelyMVCCGarbage */)
+			_, err = blobWriter.Close()
+			require.NoError(t, err)
+			require.NoError(t, tw.AddWithBlobHandle(
+				base.MakeInternalKey([]byte{'a' + byte(i)}, 1, base.InternalKeyKindSet),
+				blob.InlineHandle{
+					InlineHandlePreface: blob.InlineHandlePreface{
+						ReferenceID: base.BlobReferenceID(i),
+						ValueLen:    uint32(len(value)),
+					},
+					HandleSuffix: blob.HandleSuffix{BlockID: handle.BlockID, ValueID: handle.ValueID},
+				},
+				base.ShortAttribute(0),
+				false, /* forceObsolete */
+				base.KVMeta{},
+			))
+		}
+		require.NoError(t, tw.Close())
+		if mutate != nil {
+			mutateBlobRefIndexBlock(t, fs, objStore, tableFileNum, mutate)
+		}
+
+		opts := &Options{FS: fs}
+		opts.EnsureDefaults()
+		c := cache.New(1 << 20)
+		defer c.Unref()
+		ch := c.NewHandle()
+		defer ch.Close()
+		readable, err := objStore.OpenForReading(ctx, base.FileTypeTable, tableFileNum, objstorage.OpenOptions{})
+		require.NoError(t, err)
+		r, err := sstable.NewReader(ctx, readable, opts.MakeReaderOptions())
+		require.NoError(t, err)
+		defer func() { require.NoError(t, r.Close()) }()
+
+		closes = make([]int, len(blobFileNums))
+		blobFiles := make([]objstorage.Readable, len(blobFileNums))
+		for i, fileNum := range blobFileNums {
+			rd, err := objStore.OpenForReading(ctx, base.FileTypeBlob, fileNum, objstorage.OpenOptions{})
+			require.NoError(t, err)
+			blobFiles[i] = closeCountingReadable{Readable: rd, closes: &closes[i]}
+		}
+		tableMeta := &manifest.TableMetadata{TableNum: base.TableNum(tableFileNum)}
+		_, err = constructBlobFileMetadataForIngestedTable(
+			ctx, opts, FormatNewest, ch, tableMeta, r, blobFiles, blobFileNums)
+		return closes, err
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		closes, err := run(t, nil)
+		require.NoError(t, err)
+		require.Equal(t, []int{1, 1}, closes)
+	})
+
+	t.Run("malformed-second-reference", func(t *testing.T) {
+		closes, err := run(t, func(blk []byte) {
+			var d colblk.ReferenceLivenessBlockDecoder
+			require.NoError(t, d.InitChecked(blk))
+			require.Equal(t, 2, d.BlockDecoder().Rows())
+			// The row aliases blk: <block ID> <values size> <bitmap size> <bitmap>.
+			row := d.LivenessAtReference(1)
+			require.Len(t, row, 4)
+			require.Equal(t, byte(1), row[2])
+			row[2] = 2 // The bitmap now extends past the row.
+		})
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "ingested table 000012 blob reference 1 (blob file 000011)")
+		require.Contains(t, err.Error(), "bitmap size 2 exceeds the 1 remaining bytes")
+		require.Equal(t, []int{1, 1}, closes)
+	})
+
+	t.Run("rows-max-int32", func(t *testing.T) {
+		closes, err := run(t, func(blk []byte) { setLivenessBlockRows(blk, math.MaxInt32) })
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "ingested table 000012 blob reference index")
+		require.Regexp(t, `reference liveness block: .*extends? beyond`, err.Error())
+		require.Equal(t, []int{1, 1}, closes)
+	})
+
+	t.Run("decreasing-intermediate-offset", func(t *testing.T) {
+		closes, err := run(t, func(blk []byte) { decreaseLivenessBlockOffset(t, blk, 1) })
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "ingested table 000012 blob reference index")
+		require.Contains(t, err.Error(), "is less than the preceding offset")
+		require.Equal(t, []int{1, 1}, closes)
+	})
 }

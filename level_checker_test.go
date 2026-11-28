@@ -392,6 +392,32 @@ func TestPerformValidationForSSTableFailures(t *testing.T) {
 		require.Contains(t, err.Error(), "refID=0 blockIDs=[1] referenced by sstable 000001 is/are not present in blob reference liveness block")
 	})
 
+	t.Run("malformed_bitmap", func(t *testing.T) {
+		// A zero run whose varint length overflows, preceded by ten literal
+		// bytes; the unchecked bitmap iterator looped over it forever.
+		bitmap := append(bytes.Repeat([]byte{0x01}, 10), 0x00)
+		bitmap = append(bitmap, bytes.Repeat([]byte{0x80}, 10)...)
+		bitmap = append(bitmap, 0x01)
+		var encoding []byte
+		encoding = binary.AppendUvarint(encoding, 0)
+		encoding = binary.AppendUvarint(encoding, 30)
+		encoding = binary.AppendUvarint(encoding, uint64(len(bitmap)))
+		encoding = append(encoding, bitmap...)
+		encoder := &colblk.ReferenceLivenessBlockEncoder{}
+		encoder.Init()
+		encoder.AddReferenceLiveness(0, encoding)
+
+		var decoder colblk.ReferenceLivenessBlockDecoder
+		decoder.Init(encoder.Finish())
+		referenced := []map[blob.BlockID]valuesInfo{
+			{blob.BlockID(0): {valueIDs: []int{0}, totalSize: 30}},
+		}
+		err := performValidationForSSTable(decoder, tableNum, referenced)
+		require.Error(t, err)
+		require.True(t, base.IsCorruptionError(err), "%+v", err)
+		require.Contains(t, err.Error(), "malformed run length")
+	})
+
 	t.Run("success_case", func(t *testing.T) {
 		var decoder colblk.ReferenceLivenessBlockDecoder
 		decoder.Init(defultEncodedData)

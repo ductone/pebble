@@ -7,6 +7,7 @@ package sstable
 import (
 	"encoding/binary"
 	"iter"
+	"math"
 	"slices"
 
 	"github.com/cockroachdb/errors"
@@ -155,6 +156,10 @@ type BlobRefLivenessEncoding struct {
 // encodings from the provided buffer. Each encoding has the format:
 //
 //	<block ID> <values size> <len of bitmap> [<bitmap>]
+//
+// It returns a corruption error if an encoding is truncated, a field does not
+// fit its type, or a bitmap is malformed (see validateRunLengthBitmap). The
+// returned bitmaps may be passed to IterSetBitsInRunLengthBitmap.
 func DecodeBlobRefLivenessEncoding(buf []byte) ([]BlobRefLivenessEncoding, error) {
 	var encodings []BlobRefLivenessEncoding
 	for len(buf) > 0 {
@@ -166,6 +171,9 @@ func DecodeBlobRefLivenessEncoding(buf []byte) ([]BlobRefLivenessEncoding, error
 			return nil, base.CorruptionErrorf("cannot decode block ID from buf %x", buf)
 		}
 		buf = buf[n:]
+		if blockIDVal > math.MaxUint32 {
+			return nil, base.CorruptionErrorf("blob reference liveness block ID %d overflows uint32", blockIDVal)
+		}
 		enc.BlockID = blob.BlockID(blockIDVal)
 
 		valuesSizeVal, n := binary.Uvarint(buf)
@@ -173,6 +181,9 @@ func DecodeBlobRefLivenessEncoding(buf []byte) ([]BlobRefLivenessEncoding, error
 			return nil, base.CorruptionErrorf("cannot decode values size from buf %x", buf)
 		}
 		buf = buf[n:]
+		if valuesSizeVal > math.MaxInt {
+			return nil, base.CorruptionErrorf("blob reference liveness values size %d overflows int", valuesSizeVal)
+		}
 		enc.ValuesSize = int(valuesSizeVal)
 
 		bitmapSizeVal, n := binary.Uvarint(buf)
@@ -180,11 +191,18 @@ func DecodeBlobRefLivenessEncoding(buf []byte) ([]BlobRefLivenessEncoding, error
 			return nil, base.CorruptionErrorf("cannot decode bitmap size from buf %x", buf)
 		}
 		buf = buf[n:]
+		if bitmapSizeVal > uint64(len(buf)) {
+			return nil, base.CorruptionErrorf("blob reference liveness bitmap size %d exceeds the %d remaining bytes",
+				bitmapSizeVal, len(buf))
+		}
 		enc.BitmapSize = int(bitmapSizeVal)
 
 		// The bitmap takes up the remaining bitmapSize bytes for this encoding.
 		enc.Bitmap = buf[:enc.BitmapSize]
 		buf = buf[enc.BitmapSize:]
+		if err := validateRunLengthBitmap(enc.Bitmap); err != nil {
+			return nil, errors.Wrapf(err, "blob reference liveness block %d", enc.BlockID)
+		}
 
 		encodings = append(encodings, enc)
 	}

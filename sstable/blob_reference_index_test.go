@@ -5,8 +5,11 @@
 package sstable
 
 import (
+	"bytes"
+	"encoding/binary"
 	"iter"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/testutils"
 	"github.com/cockroachdb/pebble/sstable/blob"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/stretchr/testify/require"
 )
 
@@ -151,5 +155,128 @@ func TestBlobRefLivenessEncoding_Randomized(t *testing.T) {
 
 		reencoded := collectSlice(w.finish())
 		require.Equal(t, encoded, reencoded)
+	}
+}
+
+// TestDecodeBlobRefLivenessEncodingMalformed checks that malformed liveness
+// encodings are rejected with corruption errors instead of panicking, looping
+// or describing more bits than a blob block can hold.
+func TestDecodeBlobRefLivenessEncodingMalformed(t *testing.T) {
+	uv := func(vs ...uint64) []byte {
+		var b []byte
+		for _, v := range vs {
+			b = binary.AppendUvarint(b, v)
+		}
+		return b
+	}
+	// encoding builds <block ID> <values size> <len(bitmap)> <bitmap>.
+	encoding := func(blockID, valuesSize uint64, bitmap []byte) []byte {
+		return append(uv(blockID, valuesSize, uint64(len(bitmap))), bitmap...)
+	}
+	// overflowRun is a zero run whose varint length overflows: preceded by ten
+	// literal bytes, the unchecked iterator stepped back to offset 0 and looped
+	// forever.
+	overflowRun := append(bytes.Repeat([]byte{0x01}, 10), 0x00)
+	overflowRun = append(overflowRun, bytes.Repeat([]byte{0x80}, 10)...)
+	overflowRun = append(overflowRun, 0x01)
+	// tooManyBits describes one byte more than maxRunLengthBitmapBits allows.
+	tooManyBits := append(append([]byte{0x00}, uv(maxRunLengthBitmapBits/8)...), 0x01)
+
+	testCases := []struct {
+		name string
+		buf  []byte
+	}{
+		{name: "truncated-block-id", buf: []byte{0x80}},
+		{name: "truncated-values-size", buf: append(uv(0), 0x80)},
+		{name: "truncated-bitmap-size", buf: append(uv(0, 1), 0x80)},
+		{name: "block-id-overflow", buf: encoding(math.MaxUint32+1, 1, []byte{0x01})},
+		{name: "values-size-overflow", buf: encoding(0, uint64(math.MaxInt)+1, []byte{0x01})},
+		{name: "bitmap-beyond-buffer", buf: append(uv(0, 1, 2), 0x01)},
+		{name: "bitmap-size-overflow", buf: append(uv(0, 1, math.MaxUint64), 0x01)},
+		{name: "bitmap-truncated-run", buf: encoding(0, 1, []byte{0x01, 0xFF})},
+		{name: "bitmap-overflowing-run", buf: encoding(0, 1, overflowRun)},
+		{name: "bitmap-too-many-bits", buf: encoding(0, 1, tooManyBits)},
+		{name: "second-encoding-malformed", buf: append(encoding(0, 1, []byte{0x01}), encoding(1, 1, []byte{0x00})...)},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			encs, err := DecodeBlobRefLivenessEncoding(tc.buf)
+			require.Error(t, err)
+			require.True(t, base.IsCorruptionError(err), "%+v", err)
+			require.Nil(t, encs)
+		})
+	}
+
+	t.Run("iterator-stops-at-malformed-run", func(t *testing.T) {
+		// The iterator must terminate on an unvalidated bitmap; the literal
+		// bytes before the bad run yield bits 0, 8, ..., 72.
+		var bits []int
+		for i := range IterSetBitsInRunLengthBitmap(overflowRun) {
+			bits = append(bits, i)
+			require.Less(t, len(bits), 100)
+		}
+		require.Equal(t, []int{0, 8, 16, 24, 32, 40, 48, 56, 64, 72}, bits)
+	})
+
+	t.Run("maximum-zero-run", func(t *testing.T) {
+		// A zero run covering every representable bit followed by nothing is
+		// accepted, and neither validation nor iteration is proportional to
+		// the run length.
+		encs, err := DecodeBlobRefLivenessEncoding(
+			encoding(math.MaxUint32, 1, append([]byte{0x00}, uv(maxRunLengthBitmapBits/8)...)))
+		require.NoError(t, err)
+		require.Len(t, encs, 1)
+		require.Equal(t, blob.BlockID(math.MaxUint32), encs[0].BlockID)
+		for range IterSetBitsInRunLengthBitmap(encs[0].Bitmap) {
+			t.Fatal("unexpected set bit")
+		}
+	})
+
+	t.Run("empty-bitmap", func(t *testing.T) {
+		encs, err := DecodeBlobRefLivenessEncoding(encoding(3, 7, nil))
+		require.NoError(t, err)
+		require.Equal(t, []BlobRefLivenessEncoding{{BlockID: 3, ValuesSize: 7, Bitmap: []byte{}}}, encs)
+	})
+}
+
+// TestBlobRefLivenessBlockRoundTrip decodes a liveness block built the way the
+// table writer builds it: blobRefValueLivenessWriter encodings stored in a
+// colblk.ReferenceLivenessBlockEncoder.
+func TestBlobRefLivenessBlockRoundTrip(t *testing.T) {
+	var w blobRefValueLivenessWriter
+	w.init()
+	type live struct {
+		blockID blob.BlockID
+		valueID blob.BlockValueID
+	}
+	want := make([][]live, 3)
+	for refID := range want {
+		for blockID := blob.BlockID(refID); blockID < blob.BlockID(refID+3); blockID++ {
+			for valueID := blob.BlockValueID(0); valueID < 200; valueID += blob.BlockValueID(1 + int(valueID/50)*refID) {
+				require.NoError(t, w.addLiveValue(base.BlobReferenceID(refID), blockID, valueID, 10))
+				want[refID] = append(want[refID], live{blockID, valueID})
+			}
+		}
+	}
+	var enc colblk.ReferenceLivenessBlockEncoder
+	enc.Init()
+	for refID, buf := range w.finish() {
+		enc.AddReferenceLiveness(int(refID), buf)
+	}
+
+	var d colblk.ReferenceLivenessBlockDecoder
+	require.NoError(t, d.InitChecked(enc.Finish()))
+	require.Equal(t, len(want), d.BlockDecoder().Rows())
+	for refID := range want {
+		encs, err := DecodeBlobRefLivenessEncoding(d.LivenessAtReference(refID))
+		require.NoError(t, err)
+		var got []live
+		for _, e := range encs {
+			require.Equal(t, len(e.Bitmap), e.BitmapSize)
+			for valueID := range IterSetBitsInRunLengthBitmap(e.Bitmap) {
+				got = append(got, live{e.BlockID, blob.BlockValueID(valueID)})
+			}
+		}
+		require.Equal(t, want[refID], got)
 	}
 }
